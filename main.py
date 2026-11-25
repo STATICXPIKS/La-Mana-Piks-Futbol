@@ -8,7 +8,7 @@ import json
 import time
 import requests
 import xml.etree.ElementTree as ET
-from data_fetcher import load_historical_data, extract_team_windows, fetch_live_espn_slate, normalize_team
+from data_fetcher import load_historical_data, extract_team_windows, normalize_team
 from model_engine import analyze_market_only, analyze_sports_and_context
 from context_analyzer import (
     analyze_tactical_styles_and_neutralization,
@@ -17,7 +17,7 @@ from context_analyzer import (
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="2.7.0"
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -157,6 +157,7 @@ def get_standings_cached(known_teams: list) -> List[Dict[str, Any]]:
 
             standings_list.append({
                 "pos": int(stats.get("rank") or idx),
+                "espn_id": str(team_obj.get("id", "")),
                 "equipo_espn": team_obj["displayName"],
                 "equipo_modelo": t_norm,
                 "abreviatura": team_obj.get("abbreviation", t_norm[:3].upper()),
@@ -214,7 +215,7 @@ def build_table_pressure_from_cached(table: List[Dict[str, Any]], home_team: str
 
     return {"local": eval_t(home_team), "visitante": eval_t(away_team)}
 
-def parse_espn_events_to_slate(events: list, known_teams: list, seen_ids: set) -> list:
+def parse_espn_events_to_slate(events: list, known_teams: list, seen_ids: set, now_dt: datetime, limit_dt: datetime) -> list:
     parsed = []
     for ev in events:
         ev_id = str(ev.get("id", ""))
@@ -224,10 +225,22 @@ def parse_espn_events_to_slate(events: list, known_teams: list, seen_ids: set) -
         if not comps:
             continue
         comp = comps[0]
-        if comp.get("status", {}).get("type", {}).get("state") == "post":
+        state = comp.get("status", {}).get("type", {}).get("state", "")
+        if state == "post":
             continue
-        seen_ids.add(ev_id)
 
+        raw_date = ev.get("date", "")
+        if not raw_date:
+            continue
+        try:
+            ev_dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        if ev_dt < (now_dt - timedelta(hours=3)) or ev_dt > limit_dt:
+            continue
+
+        seen_ids.add(ev_id)
         competitors = comp["competitors"]
         home_c = next(c for c in competitors if c["homeAway"] == "home")
         away_c = next(c for c in competitors if c["homeAway"] == "away")
@@ -263,7 +276,7 @@ def parse_espn_events_to_slate(events: list, known_teams: list, seen_ids: set) -
 
         parsed.append({
             "event_id": ev_id,
-            "fecha_utc": ev.get("date", datetime.now(timezone.utc).isoformat()),
+            "fecha_utc": raw_date,
             "estado": comp.get("status", {}).get("type", {}).get("description", "Scheduled"),
             "local_espn": home_espn,
             "visitante_espn": away_espn,
@@ -277,30 +290,44 @@ def parse_espn_events_to_slate(events: list, known_teams: list, seen_ids: set) -
         })
     return parsed
 
-def fetch_full_round_espn_slate(known_teams: list) -> list:
+def fetch_full_round_espn_slate(known_teams: list, standings_table: list) -> list:
+    """
+    Obtiene toda la jornada completa (Viernes 27, Sábado 28, Domingo 29, Lunes 30 Nov)
+    combinando el scoreboard oficial y el calendario individual de los clubes de Premier League.
+    """
     now = datetime.now(timezone.utc)
-    start_str = now.strftime("%Y%m%d")
-    end_str = (now + timedelta(days=9)).strftime("%Y%m%d")
-
-    urls = [
-        f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={start_str}-{end_str}",
-        "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard"
-    ]
-
+    limit_dt = now + timedelta(days=10)
     seen_ids = set()
     slate = []
 
-    for url in urls:
+    # 1. Consultar días exactos de la semana próxima en scoreboard (YYYYMMDD)
+    for offset in range(0, 8):
+        day_str = (now + timedelta(days=offset)).strftime("%Y%m%d")
+        url_day = f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={day_str}"
         try:
-            resp = requests.get(url, timeout=8, headers=HTTP_HEADERS)
+            resp = requests.get(url_day, timeout=5, headers=HTTP_HEADERS)
             if resp.status_code == 200:
                 events = resp.json().get("events", [])
-                slate.extend(parse_espn_events_to_slate(events, known_teams, seen_ids))
+                slate.extend(parse_espn_events_to_slate(events, known_teams, seen_ids, now, limit_dt))
         except Exception:
             continue
 
-    if not slate:
-        slate = fetch_live_espn_slate(known_teams)
+    # 2. Si aún faltan partidos de la jornada (< 8 juegos), leer el calendario oficial de equipos
+    if len(slate) < 8:
+        team_ids = [t["espn_id"] for t in standings_table if t.get("espn_id")]
+        if not team_ids:
+            team_ids = ["359", "362", "349", "337", "331", "363", "384", "368", "370", "373", "357", "364", "382", "360", "361", "393", "366", "367"]
+        for tid in team_ids:
+            if len(slate) >= 10:
+                break
+            url_sched = f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/teams/{tid}/schedule"
+            try:
+                resp = requests.get(url_sched, timeout=5, headers=HTTP_HEADERS)
+                if resp.status_code == 200:
+                    events = resp.json().get("events", [])
+                    slate.extend(parse_espn_events_to_slate(events, known_teams, seen_ids, now, limit_dt))
+            except Exception:
+                continue
 
     slate.sort(key=lambda x: x["fecha_utc"])
     return slate
@@ -379,8 +406,8 @@ def registrar_pronosticos_prejuego(resultados: List[Dict[str, Any]]):
 def compute_jornada_payload() -> Dict[str, Any]:
     hist_df = get_historical_cached()
     known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
-    slate = fetch_full_round_espn_slate(known_teams)
     standings_table = get_standings_cached(known_teams)
+    slate = fetch_full_round_espn_slate(known_teams, standings_table)
     all_rss = get_rss_feed_cached()
 
     resultados = []
