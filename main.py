@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List
 import threading
@@ -17,7 +18,7 @@ from context_analyzer import (
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="3.0.0"
+    version="3.1.0"
 )
 
 app.add_middleware(
@@ -70,11 +71,11 @@ def get_rss_feed_cached() -> List[Dict[str, Any]]:
     noticias = []
     for source_name, url in rss_urls:
         try:
-            r = requests.get(url, timeout=5, headers=HTTP_HEADERS)
+            r = requests.get(url, timeout=4, headers=HTTP_HEADERS)
             if r.status_code != 200:
                 continue
             root = ET.fromstring(r.content)
-            for item in root.findall(".//item")[:25]:
+            for item in root.findall(".//item")[:20]:
                 title = (item.findtext("title") or "").strip()
                 desc = (item.findtext("description") or "").strip()
                 pub = (item.findtext("pubDate") or "").strip()
@@ -130,7 +131,7 @@ def get_standings_cached(known_teams: list) -> List[Dict[str, Any]]:
     standings_list = []
     try:
         url = "https://site.api.espn.com/apis/v2/sports/soccer/eng.1/standings"
-        resp = requests.get(url, timeout=6, headers=HTTP_HEADERS)
+        resp = requests.get(url, timeout=5, headers=HTTP_HEADERS)
         data = resp.json()
         entries = data["children"][0]["standings"]["entries"]
         for idx, entry in enumerate(entries, start=1):
@@ -290,44 +291,43 @@ def parse_espn_events_to_slate(events: list, known_teams: list, seen_ids: set, n
         })
     return parsed
 
+def _fetch_url_events(url: str) -> list:
+    try:
+        resp = requests.get(url, timeout=5, headers=HTTP_HEADERS)
+        if resp.status_code == 200:
+            return resp.json().get("events", [])
+    except Exception:
+        pass
+    return []
+
 def fetch_full_round_espn_slate(known_teams: list, standings_table: list) -> list:
     """
-    Obtiene toda la jornada completa (Viernes 27, Sábado 28, Domingo 29, Lunes 30 Nov)
-    combinando el scoreboard oficial y el calendario individual de los clubes de Premier League.
+    Descarga EN PARALELO (en ~1.5 segundos) todos los días próximos y los calendarios
+    de equipos para obtener los 10 partidos reales de la jornada (Viernes 27, Sábado 28,
+    Domingo 29, Lunes 30 Nov) sin provocar timeouts en Render.
     """
     now = datetime.now(timezone.utc)
     limit_dt = now + timedelta(days=10)
     seen_ids = set()
     slate = []
 
-    # 1. Consultar días exactos de la semana próxima en scoreboard (YYYYMMDD)
-    for offset in range(0, 8):
-        day_str = (now + timedelta(days=offset)).strftime("%Y%m%d")
-        url_day = f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={day_str}"
-        try:
-            resp = requests.get(url_day, timeout=5, headers=HTTP_HEADERS)
-            if resp.status_code == 200:
-                events = resp.json().get("events", [])
-                slate.extend(parse_espn_events_to_slate(events, known_teams, seen_ids, now, limit_dt))
-        except Exception:
-            continue
+    urls_to_fetch = [
+        f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={(now + timedelta(days=d)).strftime('%Y%m%d')}"
+        for d in range(0, 8)
+    ]
 
-    # 2. Si aún faltan partidos de la jornada (< 8 juegos), leer el calendario oficial de equipos
-    if len(slate) < 8:
-        team_ids = [t["espn_id"] for t in standings_table if t.get("espn_id")]
-        if not team_ids:
-            team_ids = ["359", "362", "349", "337", "331", "363", "384", "368", "370", "373", "357", "364", "382", "360", "361", "393", "366", "367"]
-        for tid in team_ids:
-            if len(slate) >= 10:
-                break
-            url_sched = f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/teams/{tid}/schedule"
-            try:
-                resp = requests.get(url_sched, timeout=5, headers=HTTP_HEADERS)
-                if resp.status_code == 200:
-                    events = resp.json().get("events", [])
-                    slate.extend(parse_espn_events_to_slate(events, known_teams, seen_ids, now, limit_dt))
-            except Exception:
-                continue
+    team_ids = [t["espn_id"] for t in standings_table if t.get("espn_id")][:12]
+    if not team_ids:
+        team_ids = ["359", "362", "349", "337", "331", "363", "384", "368", "364", "382", "360", "361"]
+    for tid in team_ids:
+        urls_to_fetch.append(f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/teams/{tid}/schedule")
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [pool.submit(_fetch_url_events, u) for u in urls_to_fetch]
+        for fut in as_completed(futures):
+            events = fut.result()
+            if events:
+                slate.extend(parse_espn_events_to_slate(events, known_teams, seen_ids, now, limit_dt))
 
     slate.sort(key=lambda x: x["fecha_utc"])
     return slate
@@ -513,7 +513,7 @@ def get_premier_real_audit() -> Dict[str, Any]:
             try:
                 day_str = reg["fecha_utc"][:10].replace("-", "")
                 url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={day_str}"
-                r = requests.get(url, timeout=5, headers=HTTP_HEADERS)
+                r = requests.get(url, timeout=4, headers=HTTP_HEADERS)
                 if r.status_code == 200:
                     for ev in r.json().get("events", []):
                         if str(ev.get("id")) == ev_id:
