@@ -7,7 +7,7 @@ import json
 import time
 import requests
 import xml.etree.ElementTree as ET
-from data_fetcher import load_historical_data, extract_team_windows, fetch_live_espn_slate, normalize_team
+from data_fetcher import load_historical_data, extract_team_windows, normalize_team
 from model_engine import analyze_market_only, analyze_sports_and_context
 from context_analyzer import (
     analyze_tactical_styles_and_neutralization,
@@ -16,7 +16,7 @@ from context_analyzer import (
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="2.5.0"
+    version="2.6.0"
 )
 
 app.add_middleware(
@@ -219,8 +219,11 @@ def parse_espn_events_to_slate(events: list, known_teams: list, seen_ids: set) -
         ev_id = str(ev.get("id", ""))
         if not ev_id or ev_id in seen_ids:
             continue
-        comp = ev["competitions"][0]
-        if comp["status"]["type"]["state"] == "post":
+        comps = ev.get("competitions", [])
+        if not comps:
+            continue
+        comp = comps[0]
+        if comp.get("status", {}).get("type", {}).get("state") == "post":
             continue
         seen_ids.add(ev_id)
 
@@ -260,7 +263,7 @@ def parse_espn_events_to_slate(events: list, known_teams: list, seen_ids: set) -
         parsed.append({
             "event_id": ev_id,
             "fecha_utc": ev.get("date", datetime.now(timezone.utc).isoformat()),
-            "estado": comp["status"]["type"]["description"],
+            "estado": comp.get("status", {}).get("type", {}).get("description", "Scheduled"),
             "local_espn": home_espn,
             "visitante_espn": away_espn,
             "local_modelo": home_norm,
@@ -275,35 +278,59 @@ def parse_espn_events_to_slate(events: list, known_teams: list, seen_ids: set) -
 
 def fetch_full_round_espn_slate(known_teams: list) -> list:
     """
-    Obtiene toda la jornada completa (Viernes, Sábado, Domingo, Lunes)
-    consultando el rango de fechas con limit=100 y la cartelera general de ESPN.
+    Descarga todos los partidos reales de la jornada (Viernes 27, Sábado 28,
+    Domingo 29, Lunes 30 Nov, etc.) usando el endpoint directo de jornada de ESPN
+    y el calendario de fechas individuales (YYYYMMDD sin guion) para máxima fiabilidad.
     """
     now = datetime.now(timezone.utc)
-    start_str = now.strftime("%Y%m%d")
-    end_str = (now + timedelta(days=9)).strftime("%Y%m%d")
-
-    urls = [
-        f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={start_str}-{end_str}&limit=100",
-        "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?limit=100"
-    ]
-
     seen_ids = set()
     slate = []
 
-    for url in urls:
+    # 1. Endpoint principal de jornada actual de Premier League (devuelve toda la fecha completa)
+    primary_urls = [
+        "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
+        f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={now.year}"
+    ]
+
+    for url in primary_urls:
         try:
             resp = requests.get(url, timeout=10, headers=HTTP_HEADERS)
             if resp.status_code == 200:
                 events = resp.json().get("events", [])
                 slate.extend(parse_espn_events_to_slate(events, known_teams, seen_ids))
+                if len(slate) >= 6:
+                    break
         except Exception:
             continue
 
-    if not slate:
-        slate = fetch_live_espn_slate(known_teams)
+    # 2. Si aún faltan días de la jornada, consultar los días exactos de fin de semana uno a uno
+    if len(slate) < 6:
+        for offset in range(1, 8):
+            target = now + timedelta(days=offset)
+            day_str = target.strftime("%Y%m%d")
+            url_day = f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={day_str}"
+            try:
+                resp = requests.get(url_day, timeout=6, headers=HTTP_HEADERS)
+                if resp.status_code == 200:
+                    events = resp.json().get("events", [])
+                    slate.extend(parse_espn_events_to_slate(events, known_teams, seen_ids))
+            except Exception:
+                continue
 
-    slate.sort(key=lambda x: x["fecha_utc"])
-    return slate
+    # Filtrar solo partidos dentro de los próximos 12 días para no mezclar jornadas de enero
+    limit_dt = now + timedelta(days=12)
+    filtered_slate = []
+    for m in slate:
+        try:
+            dt = datetime.fromisoformat(m["fecha_utc"].replace("Z", "+00:00"))
+            if dt <= limit_dt:
+                filtered_slate.append(m)
+        except Exception:
+            filtered_slate.append(m)
+
+    final_slate = filtered_slate if filtered_slate else slate
+    final_slate.sort(key=lambda x: x["fecha_utc"])
+    return final_slate
 
 def load_audit_store() -> Dict[str, Any]:
     if os.path.exists(AUDIT_LOG_FILE):
@@ -473,7 +500,7 @@ def get_premier_real_audit() -> Dict[str, Any]:
                 continue
             try:
                 day_str = reg["fecha_utc"][:10].replace("-", "")
-                url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={day_str}&limit=50"
+                url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={day_str}"
                 r = requests.get(url, timeout=5, headers=HTTP_HEADERS)
                 if r.status_code == 200:
                     for ev in r.json().get("events", []):
