@@ -18,7 +18,7 @@ from context_analyzer import (
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="3.1.0"
+    version="3.2.0"
 )
 
 app.add_middleware(
@@ -30,6 +30,7 @@ app.add_middleware(
 )
 
 _CACHE: Dict[str, Any] = {}
+_COMPUTE_LOCK = threading.Lock()
 CACHE_TTL_SECONDS = 900
 AUDIT_LOG_FILE = "auditoria_real_picks.json"
 MODEL_START_DATE = "2026-11-25"
@@ -293,36 +294,29 @@ def parse_espn_events_to_slate(events: list, known_teams: list, seen_ids: set, n
 
 def _fetch_url_events(url: str) -> list:
     try:
-        resp = requests.get(url, timeout=5, headers=HTTP_HEADERS)
+        resp = requests.get(url, timeout=6, headers=HTTP_HEADERS)
         if resp.status_code == 200:
             return resp.json().get("events", [])
     except Exception:
         pass
     return []
 
-def fetch_full_round_espn_slate(known_teams: list, standings_table: list) -> list:
+def fetch_full_round_espn_slate(known_teams: list) -> list:
     """
-    Descarga EN PARALELO (en ~1.5 segundos) todos los días próximos y los calendarios
-    de equipos para obtener los 10 partidos reales de la jornada (Viernes 27, Sábado 28,
-    Domingo 29, Lunes 30 Nov) sin provocar timeouts en Render.
+    Consulta en paralelo el scoreboard general + cada uno de los próximos 7 días
+    en ESPN para traer los 10 partidos reales de la jornada en <1.5 segundos.
     """
     now = datetime.now(timezone.utc)
-    limit_dt = now + timedelta(days=10)
+    limit_dt = now + timedelta(days=9)
     seen_ids = set()
     slate = []
 
-    urls_to_fetch = [
-        f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={(now + timedelta(days=d)).strftime('%Y%m%d')}"
-        for d in range(0, 8)
-    ]
+    urls_to_fetch = ["https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard"]
+    for d in range(0, 8):
+        day_str = (now + timedelta(days=d)).strftime("%Y%m%d")
+        urls_to_fetch.append(f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={day_str}")
 
-    team_ids = [t["espn_id"] for t in standings_table if t.get("espn_id")][:12]
-    if not team_ids:
-        team_ids = ["359", "362", "349", "337", "331", "363", "384", "368", "364", "382", "360", "361"]
-    for tid in team_ids:
-        urls_to_fetch.append(f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/teams/{tid}/schedule")
-
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    with ThreadPoolExecutor(max_workers=9) as pool:
         futures = [pool.submit(_fetch_url_events, u) for u in urls_to_fetch]
         for fut in as_completed(futures):
             events = fut.result()
@@ -404,72 +398,77 @@ def registrar_pronosticos_prejuego(resultados: List[Dict[str, Any]]):
         save_audit_store(store)
 
 def compute_jornada_payload() -> Dict[str, Any]:
-    hist_df = get_historical_cached()
-    known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
-    standings_table = get_standings_cached(known_teams)
-    slate = fetch_full_round_espn_slate(known_teams, standings_table)
-    all_rss = get_rss_feed_cached()
+    with _COMPUTE_LOCK:
+        cached_resp = get_cached("jornada_full")
+        if cached_resp is not None and len(cached_resp.get("partidos", [])) > 0:
+            return cached_resp
 
-    resultados = []
-    for match in slate:
-        ref_date = datetime.fromisoformat(match["fecha_utc"].replace("Z", "+00:00"))
-        home = match["local_modelo"]
-        away = match["visitante_modelo"]
+        hist_df = get_historical_cached()
+        known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
+        slate = fetch_full_round_espn_slate(known_teams)
+        standings_table = get_standings_cached(known_teams)
+        all_rss = get_rss_feed_cached()
 
-        bloque_mercado = analyze_market_only(
-            odds_raw=match["cuotas_mercado_raw"],
-            historical_df=hist_df,
-            home_team=home,
-            away_team=away
-        )
+        resultados = []
+        for match in slate:
+            ref_date = datetime.fromisoformat(match["fecha_utc"].replace("Z", "+00:00"))
+            home = match["local_modelo"]
+            away = match["visitante_modelo"]
 
-        windows = extract_team_windows(hist_df, home, away, ref_date)
-        bloque_deportivo = analyze_sports_and_context(
-            df=hist_df,
-            home_team=home,
-            away_team=away,
-            windows=windows,
-            injuries=match["bajas_reportadas"],
-            former_players=match["jugadores_en_ambos_equipos"]
-        )
+            bloque_mercado = analyze_market_only(
+                odds_raw=match["cuotas_mercado_raw"],
+                historical_df=hist_df,
+                home_team=home,
+                away_team=away
+            )
 
-        bloque_deportivo["estilos_de_juego_y_neutralizacion"] = analyze_tactical_styles_and_neutralization(
-            hist_df, home, away
-        )
-        bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = build_table_pressure_from_cached(
-            standings_table, home, away
-        )
-        bloque_deportivo["factores_extra_cancha"]["prensa_lesiones_y_rumores_rss"] = filter_team_news(
-            all_rss, match["local_espn"], match["visitante_espn"], home, away
-        )
+            windows = extract_team_windows(hist_df, home, away, ref_date)
+            bloque_deportivo = analyze_sports_and_context(
+                df=hist_df,
+                home_team=home,
+                away_team=away,
+                windows=windows,
+                injuries=match["bajas_reportadas"],
+                former_players=match["jugadores_en_ambos_equipos"]
+            )
 
-        resultados.append({
-            "partido_info": {
-                "event_id": match["event_id"],
-                "fecha_utc": match["fecha_utc"],
-                "estado": match["estado"],
-                "local": match["local_espn"],
-                "visitante": match["visitante_espn"],
-                "local_modelo": home,
-                "visitante_modelo": away,
-                "record_local": match["record_local_temporada"],
-                "record_visita": match["record_visita_temporada"]
-            },
-            "bloque_1_mercado_cuotas": bloque_mercado,
-            "bloque_2_deportivo_y_extracancha": bloque_deportivo
-        })
+            bloque_deportivo["estilos_de_juego_y_neutralizacion"] = analyze_tactical_styles_and_neutralization(
+                hist_df, home, away
+            )
+            bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = build_table_pressure_from_cached(
+                standings_table, home, away
+            )
+            bloque_deportivo["factores_extra_cancha"]["prensa_lesiones_y_rumores_rss"] = filter_team_news(
+                all_rss, match["local_espn"], match["visitante_espn"], home, away
+            )
 
-    if resultados:
-        registrar_pronosticos_prejuego(resultados)
+            resultados.append({
+                "partido_info": {
+                    "event_id": match["event_id"],
+                    "fecha_utc": match["fecha_utc"],
+                    "estado": match["estado"],
+                    "local": match["local_espn"],
+                    "visitante": match["visitante_espn"],
+                    "local_modelo": home,
+                    "visitante_modelo": away,
+                    "record_local": match["record_local_temporada"],
+                    "record_visita": match["record_visita_temporada"]
+                },
+                "bloque_1_mercado_cuotas": bloque_mercado,
+                "bloque_2_deportivo_y_extracancha": bloque_deportivo
+            })
 
-    payload = {
-        "actualizado_utc": datetime.now(timezone.utc).isoformat(),
-        "total_partidos_jornada": len(resultados),
-        "partidos": resultados
-    }
-    if len(resultados) > 0:
-        set_cached("jornada_full", payload)
-    return payload
+        if resultados:
+            registrar_pronosticos_prejuego(resultados)
+
+        payload = {
+            "actualizado_utc": datetime.now(timezone.utc).isoformat(),
+            "total_partidos_jornada": len(resultados),
+            "partidos": resultados
+        }
+        if len(resultados) > 0:
+            set_cached("jornada_full", payload)
+        return payload
 
 @app.on_event("startup")
 def warmup_cache_on_boot():
@@ -486,7 +485,8 @@ def health_check():
         "status": "online",
         "proyecto": "La-Mana-Piks-Futbol",
         "liga": "Premier League (2026-2027)",
-        "modelo_iniciado": MODEL_START_DATE
+        "modelo_iniciado": MODEL_START_DATE,
+        "jornada_en_cache": len((get_cached("jornada_full") or {}).get("partidos", []))
     }
 
 @app.get("/api/premier/jornada")
