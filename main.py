@@ -148,15 +148,10 @@ def simulate_custom_match(local: str, visitante: str) -> Dict[str, Any]:
 
 @app.get("/api/premier/liga-info")
 def get_league_standings_and_news() -> Dict[str, Any]:
-    """
-    Entrega la tabla real completa de los 20 equipos de Premier League (con escudos)
-    y el feed general de noticias, lesiones y alertas de última hora.
-    """
     try:
         hist_df = load_historical_data()
         known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
 
-        # 1. Tabla real en vivo desde ESPN
         standings_list = []
         try:
             url = "https://site.api.espn.com/apis/v2/sports/soccer/eng.1/standings"
@@ -207,7 +202,6 @@ def get_league_standings_and_news() -> Dict[str, Any]:
         except Exception:
             pass
 
-        # 2. Noticias generales de Premier League (BBC Sport + Sky Sports RSS)
         rss_urls = [
             ("BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml"),
             ("Sky Sports", "https://www.skysports.com/rss/11095")
