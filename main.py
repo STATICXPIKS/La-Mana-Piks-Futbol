@@ -4,11 +4,16 @@ from datetime import datetime, timezone
 from typing import Dict, Any
 from data_fetcher import load_historical_data, extract_team_windows, fetch_live_espn_slate, normalize_team
 from model_engine import analyze_market_only, analyze_sports_and_context
+from context_analyzer import (
+    fetch_live_standings_pressure,
+    analyze_tactical_styles_and_neutralization,
+    fetch_extra_pitch_news
+)
 
 app = FastAPI(
     title="La Maña Piks - Motor Cuantitativo Premier League",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -25,17 +30,11 @@ def health_check():
         "status": "online",
         "proyecto": "La-Mana-Piks-Futbol",
         "liga": "Premier League (2026-2027)",
-        "arquitectura": "2 Motores Independientes (Mercado vs Deportivo/Extra-Cancha)"
+        "arquitectura": "2 Motores Independientes (Mercado vs Deportivo/Táctico/Extra-Cancha)"
     }
 
 @app.get("/api/premier/jornada")
 def get_premier_league_analysis() -> Dict[str, Any]:
-    """
-    Descarga los datos reales actuales y entrega para cada partido de la jornada
-    dos bloques totalmente independientes:
-    1) analisis_mercado_cuotas
-    2) analisis_deportivo_y_extracancha
-    """
     try:
         hist_df = load_historical_data()
         known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
@@ -55,7 +54,7 @@ def get_premier_league_analysis() -> Dict[str, Any]:
                 away_team=away
             )
 
-            # 2. Extracción de ventanas históricas reales y análisis deportivo/extra-cancha
+            # 2. Análisis deportivo, táctico y extra-cancha
             windows = extract_team_windows(hist_df, home, away, ref_date)
             bloque_deportivo = analyze_sports_and_context(
                 df=hist_df,
@@ -64,6 +63,17 @@ def get_premier_league_analysis() -> Dict[str, Any]:
                 windows=windows,
                 injuries=match["bajas_reportadas"],
                 former_players=match["jugadores_en_ambos_equipos"]
+            )
+
+            # Añadir estilos de juego/neutralización, presión de tabla y noticias RSS reales
+            bloque_deportivo["estilos_de_juego_y_neutralizacion"] = analyze_tactical_styles_and_neutralization(
+                hist_df, home, away
+            )
+            bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = fetch_live_standings_pressure(
+                home, away, known_teams
+            )
+            bloque_deportivo["factores_extra_cancha"]["prensa_lesiones_y_rumores_rss"] = fetch_extra_pitch_news(
+                match["local_espn"], match["visitante_espn"], home, away
             )
 
             resultados.append({
@@ -91,10 +101,6 @@ def get_premier_league_analysis() -> Dict[str, Any]:
 
 @app.get("/api/premier/simular/{local}/{visitante}")
 def simulate_custom_match(local: str, visitante: str) -> Dict[str, Any]:
-    """
-    Permite analizar cualquier cruce específico entre 2 equipos de los 20 reales
-    de la Premier League 2026-2027 (ej. /api/premier/simular/Arsenal/M.%20City).
-    """
     try:
         hist_df = load_historical_data()
         known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
@@ -116,6 +122,15 @@ def simulate_custom_match(local: str, visitante: str) -> Dict[str, Any]:
             windows=windows,
             injuries={"local": [], "visitante": []},
             former_players=[]
+        )
+        bloque_deportivo["estilos_de_juego_y_neutralizacion"] = analyze_tactical_styles_and_neutralization(
+            hist_df, home, away
+        )
+        bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = fetch_live_standings_pressure(
+            home, away, known_teams
+        )
+        bloque_deportivo["factores_extra_cancha"]["prensa_lesiones_y_rumores_rss"] = fetch_extra_pitch_news(
+            home, away, home, away
         )
         bloque_mercado = analyze_market_only({}, hist_df, home, away)
 
