@@ -18,7 +18,7 @@ from context_analyzer import (
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="3.2.0"
+    version="3.3.0"
 )
 
 app.add_middleware(
@@ -32,7 +32,7 @@ app.add_middleware(
 _CACHE: Dict[str, Any] = {}
 _COMPUTE_LOCK = threading.Lock()
 CACHE_TTL_SECONDS = 900
-AUDIT_LOG_FILE = "auditoria_real_picks.json"
+AUDIT_LOG_FILE = "auditoria_real_picks_v2.json"
 MODEL_START_DATE = "2026-11-25"
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -302,10 +302,6 @@ def _fetch_url_events(url: str) -> list:
     return []
 
 def fetch_full_round_espn_slate(known_teams: list) -> list:
-    """
-    Consulta en paralelo el scoreboard general + cada uno de los próximos 7 días
-    en ESPN para traer los 10 partidos reales de la jornada en <1.5 segundos.
-    """
     now = datetime.now(timezone.utc)
     limit_dt = now + timedelta(days=9)
     seen_ids = set()
@@ -325,6 +321,42 @@ def fetch_full_round_espn_slate(known_teams: list) -> list:
 
     slate.sort(key=lambda x: x["fecha_utc"])
     return slate
+
+def seleccionar_pick_inteligente(dep: Dict[str, Any], home: str, away: str) -> Dict[str, Any]:
+    """
+    Misma lógica multi-mercado que la interfaz web para garantizar
+    consistencia total entre PARTIDOS y AUDITORÍA:
+    1) ML directo si el favorito supera 49.5% con ventaja >= 12% sobre el rival.
+    2) Mercado de Goles (Over/Under 2.5) o Ambos Anotan (BTTS) si supera 53.5%.
+    3) Doble Oportunidad (1X / X2) en duelos cerrados sin dominio claro.
+    """
+    p1x2 = dep["simulacion_monte_carlo"]["probabilidades_1X2_pct"]
+    pgol = dep["simulacion_monte_carlo"]["mercados_goles_pct"]
+
+    p1 = p1x2["local_1"]
+    p2 = p1x2["visita_2"]
+    pX = p1x2["empate_X"]
+    p1x = round(p1 + pX, 1)
+    px2 = round(p2 + pX, 1)
+
+    if p1 >= 49.5 and (p1 - p2) >= 12.0:
+        return {"tipo": "1", "label": f"{home} gana (ML)", "prob": p1}
+    if p2 >= 49.5 and (p2 - p1) >= 12.0:
+        return {"tipo": "2", "label": f"{away} gana (ML)", "prob": p2}
+
+    especiales = [
+        {"tipo": "O25", "label": "Over 2.5 Goles", "prob": pgol["over_2_5"]},
+        {"tipo": "BTTS_Y", "label": "Ambos Anotan · SÍ", "prob": pgol["ambos_anotan_SI"]},
+        {"tipo": "U25", "label": "Under 2.5 Goles", "prob": pgol["under_2_5"]},
+        {"tipo": "BTTS_N", "label": "Ambos Anotan · NO", "prob": pgol["ambos_anotan_NO"]},
+    ]
+    especiales.sort(key=lambda x: x["prob"], reverse=True)
+    if especiales[0]["prob"] >= 53.5:
+        return especiales[0]
+
+    if p1x >= px2:
+        return {"tipo": "1X", "label": f"{home} o Empate (1X)", "prob": p1x}
+    return {"tipo": "X2", "label": f"{away} o Empate (X2)", "prob": px2}
 
 def load_audit_store() -> Dict[str, Any]:
     if os.path.exists(AUDIT_LOG_FILE):
@@ -355,23 +387,10 @@ def registrar_pronosticos_prejuego(resultados: List[Dict[str, Any]]):
 
         dep = item["bloque_2_deportivo_y_extracancha"]
         p1x2 = dep["simulacion_monte_carlo"]["probabilidades_1X2_pct"]
-        pgol = dep["simulacion_monte_carlo"]["mercados_goles_pct"]
         home = info["local_modelo"]
         away = info["visitante_modelo"]
 
-        prob_1x = round(p1x2["local_1"] + p1x2["empate_X"], 1)
-        prob_x2 = round(p1x2["visita_2"] + p1x2["empate_X"], 1)
-
-        opciones = [
-            {"tipo": "1X", "label": f"{home} o Empate (1X)", "prob": prob_1x},
-            {"tipo": "X2", "label": f"{away} o Empate (X2)", "prob": prob_x2},
-            {"tipo": "1", "label": f"{home} gana (1)", "prob": p1x2["local_1"]},
-            {"tipo": "2", "label": f"{away} gana (2)", "prob": p1x2["visita_2"]},
-            {"tipo": "O25", "label": "Over 2.5 Goles", "prob": pgol["over_2_5"]},
-            {"tipo": "U25", "label": "Under 2.5 Goles", "prob": pgol["under_2_5"]}
-        ]
-        opciones.sort(key=lambda x: x["prob"], reverse=True)
-        pick = opciones[0]
+        pick = seleccionar_pick_inteligente(dep, home, away)
 
         registros[ev_id] = {
             "event_id": ev_id,
@@ -532,7 +551,9 @@ def get_premier_real_audit() -> Dict[str, Any]:
                                     (p_tipo == "1" and hg > ag) or
                                     (p_tipo == "2" and ag > hg) or
                                     (p_tipo == "O25" and (hg + ag) > 2.5) or
-                                    (p_tipo == "U25" and (hg + ag) < 2.5)
+                                    (p_tipo == "U25" and (hg + ag) < 2.5) or
+                                    (p_tipo == "BTTS_Y" and (hg > 0 and ag > 0)) or
+                                    (p_tipo == "BTTS_N" and (hg == 0 or ag == 0))
                                 )
                                 gano_1x2 = (hg > ag) if reg["favorito_1x2"] == "1" else (ag > hg)
 
