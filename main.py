@@ -1,9 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, List
+import time
 import requests
-import pandas as pd
 import xml.etree.ElementTree as ET
 from data_fetcher import load_historical_data, extract_team_windows, fetch_live_espn_slate, normalize_team
 from model_engine import analyze_market_only, analyze_sports_and_context
@@ -16,7 +16,7 @@ from context_analyzer import (
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="2.2.0"
+    version="2.3.0"
 )
 
 app.add_middleware(
@@ -27,27 +27,202 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Caché en memoria (TTL: 15 minutos) para evitar descargas redundantes en Render
+_CACHE: Dict[str, Any] = {}
+CACHE_TTL_SECONDS = 900
+
+def get_cached(key: str):
+    item = _CACHE.get(key)
+    if item and (time.time() - item["ts"]) < CACHE_TTL_SECONDS:
+        return item["data"]
+    return None
+
+def set_cached(key: str, data: Any):
+    _CACHE[key] = {"ts": time.time(), "data": data}
+
+def get_historical_cached():
+    df = get_cached("hist_df")
+    if df is None:
+        df = load_historical_data()
+        set_cached("hist_df", df)
+    return df
+
+def get_rss_feed_cached() -> List[Dict[str, Any]]:
+    cached = get_cached("rss_news")
+    if cached is not None:
+        return cached
+
+    rss_urls = [
+        ("BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml"),
+        ("Sky Sports", "https://www.skysports.com/rss/11095")
+    ]
+    alert_terms = [
+        "injury", "injured", "fitness", "doubt", "ruled out", "hamstring", "illness",
+        "sacked", "manager", "boss", "pressure", "return", "training", "ban", "suspended",
+        "blow", "boost", "contract", "dispute", "rumour", "weather", "postponed"
+    ]
+    noticias = []
+    for source_name, url in rss_urls:
+        try:
+            r = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                continue
+            root = ET.fromstring(r.content)
+            for item in root.findall(".//item")[:30]:
+                title = (item.findtext("title") or "").strip()
+                desc = (item.findtext("description") or "").strip()
+                pub = (item.findtext("pubDate") or "").strip()
+                txt = f"{title} {desc}".lower()
+                is_alert = any(t in txt for t in alert_terms)
+                noticias.append({
+                    "fuente": source_name,
+                    "titular": title,
+                    "resumen": desc[:180] + ("..." if len(desc) > 180 else ""),
+                    "fecha": pub,
+                    "tipo": "ALERTA / BAJA / DT" if is_alert else "NOTICIA LIGA",
+                    "critica": is_alert
+                })
+        except Exception:
+            continue
+
+    set_cached("rss_news", noticias)
+    return noticias
+
+def filter_team_news(all_news: List[Dict[str, Any]], home_espn: str, away_espn: str, home_short: str, away_short: str) -> Dict[str, Any]:
+    kh = {home_espn.lower(), home_short.lower()}
+    ka = {away_espn.lower(), away_short.lower()}
+    if "man united" in ka or "manchester united" in ka:
+        ka.update(["man utd", "pochettino"])
+    if "man united" in kh or "manchester united" in kh:
+        kh.update(["man utd", "pochettino"])
+    if "man city" in ka or "manchester city" in ka:
+        ka.update(["man city", "maresca"])
+    if "man city" in kh or "manchester city" in kh:
+        kh.update(["man city", "maresca"])
+
+    nh, na = [], []
+    for n in all_news:
+        txt = f"{n['titular']} {n['resumen']}".lower()
+        entry = {
+            "fuente": n["fuente"],
+            "titular": n["titular"],
+            "fecha": n["fecha"],
+            "alerta_impacto_extracancha": n["critica"]
+        }
+        if any(k in txt for k in kh) and len(nh) < 5:
+            nh.append(entry)
+        if any(k in txt for k in ka) and len(na) < 5:
+            na.append(entry)
+    return {"noticias_y_alertas_local": nh, "noticias_y_alertas_visitante": na}
+
+def get_standings_cached(known_teams: list) -> List[Dict[str, Any]]:
+    cached = get_cached("standings_raw")
+    if cached is not None:
+        return cached
+
+    standings_list = []
+    try:
+        url = "https://site.api.espn.com/apis/v2/sports/soccer/eng.1/standings"
+        resp = requests.get(url, timeout=8)
+        data = resp.json()
+        entries = data["children"][0]["standings"]["entries"]
+        for idx, entry in enumerate(entries, start=1):
+            team_obj = entry["team"]
+            t_norm = normalize_team(team_obj["displayName"], known_teams)
+            logos = team_obj.get("logos", [])
+            logo_url = logos[0]["href"] if logos else ""
+            stats = {}
+            for s in entry.get("stats", []):
+                val = s.get("value") if s.get("value") is not None else s.get("displayValue", 0)
+                try:
+                    stats[s["name"]] = float(val)
+                except Exception:
+                    stats[s["name"]] = 0
+
+            jj = int(stats.get("gamesPlayed", 0))
+            gf = int(stats.get("pointsFor", 0))
+            gc = int(stats.get("pointsAgainst", 0))
+            pts = int(stats.get("points", 0))
+            dif = int(stats.get("pointDifferential", gf - gc))
+            gfj = round(gf / max(jj, 1), 2)
+            gcj = round(gc / max(jj, 1), 2)
+            pyth = round(((gf ** 1.35) / max((gf ** 1.35) + (gc ** 1.35), 1)) * 100.0, 1) if (gf + gc) > 0 else 50.0
+
+            standings_list.append({
+                "pos": int(stats.get("rank") or idx),
+                "equipo_espn": team_obj["displayName"],
+                "equipo_modelo": t_norm,
+                "abreviatura": team_obj.get("abbreviation", t_norm[:3].upper()),
+                "escudo": logo_url,
+                "jj": jj,
+                "g": int(stats.get("wins", 0)),
+                "e": int(stats.get("ties", 0)),
+                "p": int(stats.get("losses", 0)),
+                "gf": gf,
+                "gc": gc,
+                "dif": dif,
+                "pts": pts,
+                "gfj": gfj,
+                "gcj": gcj,
+                "pyth": pyth
+            })
+        standings_list.sort(key=lambda x: (x["pos"], -x["pts"], -x["dif"]))
+        for i, r in enumerate(standings_list, start=1):
+            r["pos"] = i
+    except Exception:
+        pass
+
+    set_cached("standings_raw", standings_list)
+    return standings_list
+
+def build_table_pressure_from_cached(table: List[Dict[str, Any]], home_team: str, away_team: str) -> Dict[str, Any]:
+    if len(table) < 18:
+        return {"estado": "Tabla no disponible"}
+    pts_1st = table[0]["pts"]
+    pts_4th = table[3]["pts"]
+    pts_6th = table[5]["pts"]
+    pts_17th = table[16]["pts"]
+    pts_18th = table[17]["pts"]
+
+    def eval_t(team: str) -> Dict[str, Any]:
+        row = next((r for r in table if r["equipo_modelo"] == team), None)
+        if not row:
+            return {"posicion_actual": "-", "puntos": 0, "contexto_clasificacion": "Sin datos"}
+        pos = row["pos"]
+        pts = row["pts"]
+        if pos == 1:
+            obj = f"Líder (+{pts - table[1]['pts']} pts sobre el 2°)"
+        elif pos <= 4:
+            obj = f"Zona Champions (a {pts_1st - pts} pts del líder, +{pts - table[4]['pts']} pts sobre el 5°)"
+        elif pos <= 7:
+            obj = f"Pelea Europa (a {pts_4th - pts} pts de Champions)"
+        elif pos >= 18:
+            obj = f"Zona DESCENSO (a {pts_17th - pts} pts de salvación)"
+        elif pos >= 15:
+            obj = f"Alerta descenso (solo +{pts - pts_18th} pts sobre el 18°)"
+        else:
+            obj = f"Mitad de tabla (a {pts_6th - pts} pts de Europa / +{pts - pts_18th} pts sobre descenso)"
+        return {"posicion_actual": pos, "puntos": pts, "diferencia_goles": row["dif"], "contexto_clasificacion": obj}
+
+    return {"local": eval_t(home_team), "visitante": eval_t(away_team)}
+
 @app.get("/")
 def health_check():
     return {
         "status": "online",
         "proyecto": "La-Mana-Piks-Futbol",
         "liga": "Premier League (2026-2027)",
-        "arquitectura": "2 Motores Independientes + Auditoría Pre-Juego"
+        "cache_activo": True
     }
 
 def fetch_multi_day_slate(known_teams: list) -> list:
-    """
-    Consulta la cartelera de ESPN de los próximos 10 días para capturar
-    todos los días de la jornada (ej. Viernes, Sábado, Domingo, Lunes).
-    """
     now = datetime.now(timezone.utc)
     start_str = now.strftime("%Y%m%d")
     end_str = (now + timedelta(days=10)).strftime("%Y%m%d")
     url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={start_str}-{end_str}"
 
     try:
-        resp = requests.get(url, timeout=12)
+        resp = requests.get(url, timeout=8)
         resp.raise_for_status()
         data = resp.json()
     except Exception:
@@ -60,9 +235,8 @@ def fetch_multi_day_slate(known_teams: list) -> list:
     slate = []
     for ev in events:
         comp = ev["competitions"][0]
-        status_state = comp["status"]["type"]["state"]
-        if status_state == "post":
-            continue  # Solo partidos futuros o en curso
+        if comp["status"]["type"]["state"] == "post":
+            continue
 
         competitors = comp["competitors"]
         home_c = next(c for c in competitors if c["homeAway"] == "home")
@@ -116,10 +290,16 @@ def fetch_multi_day_slate(known_teams: list) -> list:
 
 @app.get("/api/premier/jornada")
 def get_premier_league_analysis() -> Dict[str, Any]:
+    cached_resp = get_cached("jornada_full")
+    if cached_resp is not None:
+        return cached_resp
+
     try:
-        hist_df = load_historical_data()
+        hist_df = get_historical_cached()
         known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
         slate = fetch_multi_day_slate(known_teams)
+        standings_table = get_standings_cached(known_teams)
+        all_rss = get_rss_feed_cached()
 
         resultados = []
         for match in slate:
@@ -147,11 +327,11 @@ def get_premier_league_analysis() -> Dict[str, Any]:
             bloque_deportivo["estilos_de_juego_y_neutralizacion"] = analyze_tactical_styles_and_neutralization(
                 hist_df, home, away
             )
-            bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = fetch_live_standings_pressure(
-                home, away, known_teams
+            bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = build_table_pressure_from_cached(
+                standings_table, home, away
             )
-            bloque_deportivo["factores_extra_cancha"]["prensa_lesiones_y_rumores_rss"] = fetch_extra_pitch_news(
-                match["local_espn"], match["visitante_espn"], home, away
+            bloque_deportivo["factores_extra_cancha"]["prensa_lesiones_y_rumores_rss"] = filter_team_news(
+                all_rss, match["local_espn"], match["visitante_espn"], home, away
             )
 
             resultados.append({
@@ -170,31 +350,31 @@ def get_premier_league_analysis() -> Dict[str, Any]:
                 "bloque_2_deportivo_y_extracancha": bloque_deportivo
             })
 
-        return {
+        payload = {
             "actualizado_utc": datetime.now(timezone.utc).isoformat(),
             "total_partidos_jornada": len(resultados),
             "partidos": resultados
         }
+        set_cached("jornada_full", payload)
+        return payload
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/premier/auditoria")
 def get_premier_backtest_audit() -> Dict[str, Any]:
-    """
-    Auditoría retrospectiva estricta: toma la última fecha de partidos jugados
-    y simula qué habría pronosticado el modelo usando ÚNICAMENTE datos previos
-    a esos juegos (sin mirar los resultados futuros).
-    """
+    cached_audit = get_cached("auditoria_full")
+    if cached_audit is not None:
+        return cached_audit
+
     try:
-        hist_df = load_historical_data()
+        hist_df = get_historical_cached()
         pl_df = hist_df[hist_df["Season"].str.contains("PL")].copy()
         if pl_df.empty:
             pl_df = hist_df.copy()
 
-        # Tomar los últimos 10 partidos jugados de Premier League (la última jornada completa)
         last_10 = pl_df.sort_values("DateParsed").tail(10)
         if last_10.empty:
-            return {"fecha_auditoria": "N/A", "partidos": []}
+            return {"fecha_etiqueta": "N/A", "total": 0, "aciertos_pick": 0, "aciertos_ml": 0, "partidos": []}
 
         cutoff_date = last_10["DateParsed"].min()
         prior_df = hist_df[hist_df["DateParsed"] < cutoff_date].copy()
@@ -226,7 +406,6 @@ def get_premier_backtest_audit() -> Dict[str, Any]:
             p1x2 = dep["simulacion_monte_carlo"]["probabilidades_1X2_pct"]
             pgol = dep["simulacion_monte_carlo"]["mercados_goles_pct"]
 
-            # Evaluar mejor pick pre-juego
             prob_1x = round(p1x2["local_1"] + p1x2["empate_X"], 1)
             prob_x2 = round(p1x2["visita_2"] + p1x2["empate_X"], 1)
 
@@ -241,7 +420,6 @@ def get_premier_backtest_audit() -> Dict[str, Any]:
             opciones.sort(key=lambda x: x["prob"], reverse=True)
             pick_elegido = opciones[0]
 
-            # Favorito directo 1X2
             ml_fav_home = p1x2["local_1"] >= p1x2["visita_2"]
             ml_acerto = (hg > ag) if ml_fav_home else (ag > hg)
 
@@ -268,29 +446,31 @@ def get_premier_backtest_audit() -> Dict[str, Any]:
             })
 
         fecha_label = last_10["DateParsed"].max().strftime("%d %b").upper()
-        return {
+        payload = {
             "fecha_etiqueta": fecha_label,
             "total": len(audit_matches),
             "aciertos_pick": aciertos_pick,
             "aciertos_ml": aciertos_ml,
             "partidos": audit_matches
         }
+        set_cached("auditoria_full", payload)
+        return payload
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/premier/simular/{local}/{visitante}")
 def simulate_custom_match(local: str, visitante: str) -> Dict[str, Any]:
     try:
-        hist_df = load_historical_data()
+        hist_df = get_historical_cached()
         known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
         home = normalize_team(local, known_teams)
         away = normalize_team(visitante, known_teams)
 
         if home not in known_teams or away not in known_teams:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Equipo no encontrado. Equipos disponibles: {known_teams}"
-            )
+            raise HTTPException(status_code=400, detail=f"Equipo no encontrado. Disponibles: {known_teams}")
+
+        standings_table = get_standings_cached(known_teams)
+        all_rss = get_rss_feed_cached()
 
         now = datetime.now(timezone.utc)
         windows = extract_team_windows(hist_df, home, away, now)
@@ -305,11 +485,11 @@ def simulate_custom_match(local: str, visitante: str) -> Dict[str, Any]:
         bloque_deportivo["estilos_de_juego_y_neutralizacion"] = analyze_tactical_styles_and_neutralization(
             hist_df, home, away
         )
-        bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = fetch_live_standings_pressure(
-            home, away, known_teams
+        bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = build_table_pressure_from_cached(
+            standings_table, home, away
         )
-        bloque_deportivo["factores_extra_cancha"]["prensa_lesiones_y_rumores_rss"] = fetch_extra_pitch_news(
-            home, away, home, away
+        bloque_deportivo["factores_extra_cancha"]["prensa_lesiones_y_rumores_rss"] = filter_team_news(
+            all_rss, home, away, home, away
         )
         bloque_mercado = analyze_market_only({}, hist_df, home, away)
 
@@ -328,92 +508,10 @@ def simulate_custom_match(local: str, visitante: str) -> Dict[str, Any]:
 @app.get("/api/premier/liga-info")
 def get_league_standings_and_news() -> Dict[str, Any]:
     try:
-        hist_df = load_historical_data()
+        hist_df = get_historical_cached()
         known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
-
-        standings_list = []
-        try:
-            url = "https://site.api.espn.com/apis/v2/sports/soccer/eng.1/standings"
-            resp = requests.get(url, timeout=10)
-            data = resp.json()
-            entries = data["children"][0]["standings"]["entries"]
-            for idx, entry in enumerate(entries, start=1):
-                team_obj = entry["team"]
-                t_norm = normalize_team(team_obj["displayName"], known_teams)
-                logos = team_obj.get("logos", [])
-                logo_url = logos[0]["href"] if logos else ""
-                stats = {}
-                for s in entry.get("stats", []):
-                    val = s.get("value") if s.get("value") is not None else s.get("displayValue", 0)
-                    try:
-                        stats[s["name"]] = float(val)
-                    except Exception:
-                        stats[s["name"]] = 0
-
-                jj = int(stats.get("gamesPlayed", 0))
-                gf = int(stats.get("pointsFor", 0))
-                gc = int(stats.get("pointsAgainst", 0))
-                pts = int(stats.get("points", 0))
-                dif = int(stats.get("pointDifferential", gf - gc))
-                gfj = round(gf / max(jj, 1), 2)
-                gcj = round(gc / max(jj, 1), 2)
-                pyth = round(((gf ** 1.35) / max((gf ** 1.35) + (gc ** 1.35), 1)) * 100.0, 1) if (gf + gc) > 0 else 50.0
-
-                standings_list.append({
-                    "pos": int(stats.get("rank") or idx),
-                    "equipo_espn": team_obj["displayName"],
-                    "equipo_modelo": t_norm,
-                    "abreviatura": team_obj.get("abbreviation", t_norm[:3].upper()),
-                    "escudo": logo_url,
-                    "jj": jj,
-                    "g": int(stats.get("wins", 0)),
-                    "e": int(stats.get("ties", 0)),
-                    "p": int(stats.get("losses", 0)),
-                    "gf": gf,
-                    "gc": gc,
-                    "dif": dif,
-                    "pts": pts,
-                    "gfj": gfj,
-                    "gcj": gcj,
-                    "pyth": pyth
-                })
-            standings_list.sort(key=lambda x: (x["pos"], -x["pts"], -x["dif"]))
-        except Exception:
-            pass
-
-        rss_urls = [
-            ("BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml"),
-            ("Sky Sports", "https://www.skysports.com/rss/11095")
-        ]
-        alert_terms = [
-            "injury", "injured", "fitness", "doubt", "ruled out", "hamstring", "illness",
-            "sacked", "manager", "boss", "pressure", "return", "training", "ban", "suspended",
-            "blow", "boost", "contract", "dispute", "rumour", "weather", "postponed"
-        ]
-        noticias = []
-        for source_name, url in rss_urls:
-            try:
-                r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-                if r.status_code != 200:
-                    continue
-                root = ET.fromstring(r.content)
-                for item in root.findall(".//item")[:25]:
-                    title = (item.findtext("title") or "").strip()
-                    desc = (item.findtext("description") or "").strip()
-                    pub = (item.findtext("pubDate") or "").strip()
-                    txt = f"{title} {desc}".lower()
-                    is_alert = any(t in txt for t in alert_terms)
-                    noticias.append({
-                        "fuente": source_name,
-                        "titular": title,
-                        "resumen": desc[:180] + ("..." if len(desc) > 180 else ""),
-                        "fecha": pub,
-                        "tipo": "ALERTA / BAJA / DT" if is_alert else "NOTICIA LIGA",
-                        "critica": is_alert
-                    })
-            except Exception:
-                continue
-
+        standings_list = get_standings_cached(known_teams)
+        noticias = get_rss_feed_cached()
         return {
             "tabla_posiciones": standings_list,
             "noticias_liga": noticias[:30]
