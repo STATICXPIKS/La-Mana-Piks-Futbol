@@ -2,21 +2,21 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List
+import os
+import json
 import time
 import requests
 import xml.etree.ElementTree as ET
-from data_fetcher import load_historical_data, extract_team_windows, fetch_live_espn_slate, normalize_team
+from data_fetcher import load_historical_data, extract_team_windows, normalize_team
 from model_engine import analyze_market_only, analyze_sports_and_context
 from context_analyzer import (
-    fetch_live_standings_pressure,
     analyze_tactical_styles_and_neutralization,
-    fetch_extra_pitch_news
 )
 
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="2.3.0"
+    version="2.4.0"
 )
 
 app.add_middleware(
@@ -27,9 +27,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Caché en memoria (TTL: 15 minutos) para evitar descargas redundantes en Render
 _CACHE: Dict[str, Any] = {}
 CACHE_TTL_SECONDS = 900
+AUDIT_LOG_FILE = "auditoria_real_picks.json"
+MODEL_START_DATE = "2026-11-25"
 
 def get_cached(key: str):
     item = _CACHE.get(key)
@@ -206,87 +207,170 @@ def build_table_pressure_from_cached(table: List[Dict[str, Any]], home_team: str
 
     return {"local": eval_t(home_team), "visitante": eval_t(away_team)}
 
+def fetch_day_by_day_espn_slate(known_teams: list) -> list:
+    """
+    Consulta día por día en ESPN (de hoy hasta +7 días) para capturar
+    todos los partidos reales de cada jornada (Viernes, Sábado, Domingo, Lunes)
+    con su fecha y hora UTC exactas.
+    """
+    now = datetime.now(timezone.utc)
+    seen_ids = set()
+    slate = []
+
+    for offset in range(0, 8):
+        target_day = now + timedelta(days=offset)
+        day_str = target_day.strftime("%Y%m%d")
+        url = f"https://site.api.espn.com/apis/v2/sports/soccer/eng.1/scoreboard?dates={day_str}"
+        try:
+            resp = requests.get(url, timeout=6)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            for ev in data.get("events", []):
+                ev_id = str(ev.get("id", ""))
+                if not ev_id or ev_id in seen_ids:
+                    continue
+                comp = ev["competitions"][0]
+                if comp["status"]["type"]["state"] == "post":
+                    continue
+                seen_ids.add(ev_id)
+
+                competitors = comp["competitors"]
+                home_c = next(c for c in competitors if c["homeAway"] == "home")
+                away_c = next(c for c in competitors if c["homeAway"] == "away")
+
+                home_espn = home_c["team"]["displayName"]
+                away_espn = away_c["team"]["displayName"]
+                home_norm = normalize_team(home_espn, known_teams)
+                away_norm = normalize_team(away_espn, known_teams)
+
+                odds_data = {}
+                if comp.get("odds"):
+                    primary_odds = comp["odds"][0]
+                    odds_data = {
+                        "proveedor": primary_odds.get("provider", {}).get("name", "Mercado"),
+                        "over_under_linea": primary_odds.get("overUnder"),
+                        "home_moneyline": primary_odds.get("homeTeamOdds", {}).get("moneyLine"),
+                        "away_moneyline": primary_odds.get("awayTeamOdds", {}).get("moneyLine"),
+                        "draw_moneyline": primary_odds.get("drawOdds", {}).get("moneyLine"),
+                    }
+
+                injuries_home, injuries_away = [], []
+                for inj_group in comp.get("injuries", []):
+                    t_name = normalize_team(inj_group.get("team", {}).get("displayName", ""), known_teams)
+                    for item in inj_group.get("injuries", []):
+                        ath = item.get("athlete", {}).get("displayName", "")
+                        st = item.get("status", "")
+                        if ath:
+                            label = f"{ath} ({st})" if st else ath
+                            if t_name == home_norm:
+                                injuries_home.append(label)
+                            elif t_name == away_norm:
+                                injuries_away.append(label)
+
+                slate.append({
+                    "event_id": ev_id,
+                    "fecha_utc": ev.get("date", target_day.isoformat()),
+                    "estado": comp["status"]["type"]["description"],
+                    "local_espn": home_espn,
+                    "visitante_espn": away_espn,
+                    "local_modelo": home_norm,
+                    "visitante_modelo": away_norm,
+                    "record_local_temporada": home_c.get("records", [{}])[0].get("summary", ""),
+                    "record_visita_temporada": away_c.get("records", [{}])[0].get("summary", ""),
+                    "cuotas_mercado_raw": odds_data,
+                    "bajas_reportadas": {"local": injuries_home, "visitante": injuries_away},
+                    "jugadores_en_ambos_equipos": []
+                })
+        except Exception:
+            continue
+
+    slate.sort(key=lambda x: x["fecha_utc"])
+    return slate
+
+def load_audit_store() -> Dict[str, Any]:
+    if os.path.exists(AUDIT_LOG_FILE):
+        try:
+            with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"modelo_iniciado": MODEL_START_DATE, "registros": {}}
+
+def save_audit_store(store: Dict[str, Any]):
+    try:
+        with open(AUDIT_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def registrar_pronosticos_prejuego(resultados: List[Dict[str, Any]]):
+    """
+    Congela los pronósticos emitidos antes de que inicie cada partido
+    para que la Auditoría sea 100% real desde hoy (25 Nov 2026) en adelante.
+    """
+    store = load_audit_store()
+    registros = store.setdefault("registros", {})
+    changed = False
+
+    for item in resultados:
+        info = item["partido_info"]
+        ev_id = str(info["event_id"])
+        if ev_id in registros:
+            continue
+
+        dep = item["bloque_2_deportivo_y_extracancha"]
+        p1x2 = dep["simulacion_monte_carlo"]["probabilidades_1X2_pct"]
+        pgol = dep["simulacion_monte_carlo"]["mercados_goles_pct"]
+        home = info["local_modelo"]
+        away = info["visitante_modelo"]
+
+        prob_1x = round(p1x2["local_1"] + p1x2["empate_X"], 1)
+        prob_x2 = round(p1x2["visita_2"] + p1x2["empate_X"], 1)
+
+        opciones = [
+            {"tipo": "1X", "label": f"{home} o Empate (1X)", "prob": prob_1x},
+            {"tipo": "X2", "label": f"{away} o Empate (X2)", "prob": prob_x2},
+            {"tipo": "1", "label": f"{home} gana (1)", "prob": p1x2["local_1"]},
+            {"tipo": "2", "label": f"{away} gana (2)", "prob": p1x2["visita_2"]},
+            {"tipo": "O25", "label": "Over 2.5 Goles", "prob": pgol["over_2_5"]},
+            {"tipo": "U25", "label": "Under 2.5 Goles", "prob": pgol["under_2_5"]}
+        ]
+        opciones.sort(key=lambda x: x["prob"], reverse=True)
+        pick = opciones[0]
+
+        registros[ev_id] = {
+            "event_id": ev_id,
+            "fecha_utc": info["fecha_utc"],
+            "emitido_utc": datetime.now(timezone.utc).isoformat(),
+            "local": home,
+            "visitante": away,
+            "local_espn": info["local"],
+            "visitante_espn": info["visitante"],
+            "pick_tipo": pick["tipo"],
+            "pick_label": pick["label"],
+            "prob_pick": pick["prob"],
+            "favorito_1x2": "1" if p1x2["local_1"] >= p1x2["visita_2"] else "2",
+            "xg_local": dep["fuerzas_y_elo_dinamico"]["xg_proyectado_local"],
+            "xg_visita": dep["fuerzas_y_elo_dinamico"]["xg_proyectado_visitante"],
+            "estado": "PENDIENTE",
+            "marcador_real": None,
+            "acerto_pick": None,
+            "acerto_1x2": None
+        }
+        changed = True
+
+    if changed:
+        save_audit_store(store)
+
 @app.get("/")
 def health_check():
     return {
         "status": "online",
         "proyecto": "La-Mana-Piks-Futbol",
         "liga": "Premier League (2026-2027)",
-        "cache_activo": True
+        "modelo_iniciado": MODEL_START_DATE
     }
-
-def fetch_multi_day_slate(known_teams: list) -> list:
-    now = datetime.now(timezone.utc)
-    start_str = now.strftime("%Y%m%d")
-    end_str = (now + timedelta(days=10)).strftime("%Y%m%d")
-    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={start_str}-{end_str}"
-
-    try:
-        resp = requests.get(url, timeout=8)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        return fetch_live_espn_slate(known_teams)
-
-    events = data.get("events", [])
-    if not events:
-        return fetch_live_espn_slate(known_teams)
-
-    slate = []
-    for ev in events:
-        comp = ev["competitions"][0]
-        if comp["status"]["type"]["state"] == "post":
-            continue
-
-        competitors = comp["competitors"]
-        home_c = next(c for c in competitors if c["homeAway"] == "home")
-        away_c = next(c for c in competitors if c["homeAway"] == "away")
-
-        home_espn = home_c["team"]["displayName"]
-        away_espn = away_c["team"]["displayName"]
-        home_norm = normalize_team(home_espn, known_teams)
-        away_norm = normalize_team(away_espn, known_teams)
-
-        odds_data = {}
-        if comp.get("odds"):
-            primary_odds = comp["odds"][0]
-            odds_data = {
-                "proveedor": primary_odds.get("provider", {}).get("name", "Mercado"),
-                "over_under_linea": primary_odds.get("overUnder"),
-                "home_moneyline": primary_odds.get("homeTeamOdds", {}).get("moneyLine"),
-                "away_moneyline": primary_odds.get("awayTeamOdds", {}).get("moneyLine"),
-                "draw_moneyline": primary_odds.get("drawOdds", {}).get("moneyLine"),
-            }
-
-        injuries_home, injuries_away = [], []
-        for inj_group in comp.get("injuries", []):
-            t_name = normalize_team(inj_group.get("team", {}).get("displayName", ""), known_teams)
-            for item in inj_group.get("injuries", []):
-                ath = item.get("athlete", {}).get("displayName", "")
-                st = item.get("status", "")
-                if ath:
-                    label = f"{ath} ({st})" if st else ath
-                    if t_name == home_norm:
-                        injuries_home.append(label)
-                    elif t_name == away_norm:
-                        injuries_away.append(label)
-
-        slate.append({
-            "event_id": ev["id"],
-            "fecha_utc": ev["date"],
-            "estado": comp["status"]["type"]["description"],
-            "local_espn": home_espn,
-            "visitante_espn": away_espn,
-            "local_modelo": home_norm,
-            "visitante_modelo": away_norm,
-            "record_local_temporada": home_c.get("records", [{}])[0].get("summary", ""),
-            "record_visita_temporada": away_c.get("records", [{}])[0].get("summary", ""),
-            "cuotas_mercado_raw": odds_data,
-            "bajas_reportadas": {"local": injuries_home, "visitante": injuries_away},
-            "jugadores_en_ambos_equipos": []
-        })
-
-    return slate if slate else fetch_live_espn_slate(known_teams)
 
 @app.get("/api/premier/jornada")
 def get_premier_league_analysis() -> Dict[str, Any]:
@@ -297,7 +381,7 @@ def get_premier_league_analysis() -> Dict[str, Any]:
     try:
         hist_df = get_historical_cached()
         known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
-        slate = fetch_multi_day_slate(known_teams)
+        slate = fetch_day_by_day_espn_slate(known_teams)
         standings_table = get_standings_cached(known_teams)
         all_rss = get_rss_feed_cached()
 
@@ -350,6 +434,8 @@ def get_premier_league_analysis() -> Dict[str, Any]:
                 "bloque_2_deportivo_y_extracancha": bloque_deportivo
             })
 
+        registrar_pronosticos_prejuego(resultados)
+
         payload = {
             "actualizado_utc": datetime.now(timezone.utc).isoformat(),
             "total_partidos_jornada": len(resultados),
@@ -361,100 +447,71 @@ def get_premier_league_analysis() -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/premier/auditoria")
-def get_premier_backtest_audit() -> Dict[str, Any]:
-    cached_audit = get_cached("auditoria_full")
-    if cached_audit is not None:
-        return cached_audit
-
+def get_premier_real_audit() -> Dict[str, Any]:
+    """
+    Auditoría 100% real desde el nacimiento del modelo (25 Nov 2026).
+    Verifica en ESPN si los partidos ya concluyeron para calificarlos automáticamente
+    con ✓ o ✗, y muestra los pendientes listos para jugarse.
+    """
     try:
-        hist_df = get_historical_cached()
-        pl_df = hist_df[hist_df["Season"].str.contains("PL")].copy()
-        if pl_df.empty:
-            pl_df = hist_df.copy()
+        store = load_audit_store()
+        registros = store.get("registros", {})
+        changed = False
 
-        last_10 = pl_df.sort_values("DateParsed").tail(10)
-        if last_10.empty:
-            return {"fecha_etiqueta": "N/A", "total": 0, "aciertos_pick": 0, "aciertos_ml": 0, "partidos": []}
+        # Verificar resultados reales en ESPN para los partidos registrados
+        for ev_id, reg in registros.items():
+            if reg.get("estado") == "FINALIZADO":
+                continue
+            try:
+                day_str = reg["fecha_utc"][:10].replace("-", "")
+                url = f"https://site.api.espn.com/apis/v2/sports/soccer/eng.1/scoreboard?dates={day_str}"
+                r = requests.get(url, timeout=5)
+                if r.status_code == 200:
+                    for ev in r.json().get("events", []):
+                        if str(ev.get("id")) == ev_id:
+                            comp = ev["competitions"][0]
+                            if comp["status"]["type"]["state"] == "post":
+                                comps = comp["competitors"]
+                                hc = next(c for c in comps if c["homeAway"] == "home")
+                                ac = next(c for c in comps if c["homeAway"] == "away")
+                                hg = int(hc.get("score", 0))
+                                ag = int(ac.get("score", 0))
 
-        cutoff_date = last_10["DateParsed"].min()
-        prior_df = hist_df[hist_df["DateParsed"] < cutoff_date].copy()
-        if len(prior_df) < 30:
-            prior_df = hist_df.iloc[:-len(last_10)].copy()
+                                p_tipo = reg["pick_tipo"]
+                                gano_pick = (
+                                    (p_tipo == "1X" and hg >= ag) or
+                                    (p_tipo == "X2" and ag >= hg) or
+                                    (p_tipo == "1" and hg > ag) or
+                                    (p_tipo == "2" and ag > hg) or
+                                    (p_tipo == "O25" and (hg + ag) > 2.5) or
+                                    (p_tipo == "U25" and (hg + ag) < 2.5)
+                                )
+                                gano_1x2 = (hg > ag) if reg["favorito_1x2"] == "1" else (ag > hg)
 
-        audit_matches = []
-        aciertos_pick = 0
-        aciertos_ml = 0
+                                reg["estado"] = "FINALIZADO"
+                                reg["marcador_real"] = f"{hg}–{ag}"
+                                reg["acerto_pick"] = bool(gano_pick)
+                                reg["acerto_1x2"] = bool(gano_1x2)
+                                changed = True
+            except Exception:
+                continue
 
-        for _, row in last_10.iterrows():
-            home = row["HomeTeam"]
-            away = row["AwayTeam"]
-            hg = int(row["FTHG"])
-            ag = int(row["FTAG"])
-            match_dt = row["DateParsed"].to_pydatetime().replace(tzinfo=timezone.utc)
+        if changed:
+            save_audit_store(store)
 
-            windows = extract_team_windows(prior_df, home, away, match_dt)
-            dep = analyze_sports_and_context(
-                df=prior_df,
-                home_team=home,
-                away_team=away,
-                windows=windows,
-                injuries={"local": [], "visitante": []},
-                former_players=[]
-            )
-            dep["estilos_de_juego_y_neutralizacion"] = analyze_tactical_styles_and_neutralization(prior_df, home, away)
+        lista = sorted(registros.values(), key=lambda x: x["fecha_utc"])
+        finalizados = [x for x in lista if x["estado"] == "FINALIZADO"]
+        aciertos_pick = sum(1 for x in finalizados if x["acerto_pick"])
+        aciertos_1x2 = sum(1 for x in finalizados if x["acerto_1x2"])
 
-            p1x2 = dep["simulacion_monte_carlo"]["probabilidades_1X2_pct"]
-            pgol = dep["simulacion_monte_carlo"]["mercados_goles_pct"]
-
-            prob_1x = round(p1x2["local_1"] + p1x2["empate_X"], 1)
-            prob_x2 = round(p1x2["visita_2"] + p1x2["empate_X"], 1)
-
-            opciones = [
-                {"tipo": "1X", "label": f"{home} o Empate (1X)", "prob": prob_1x, "gano": hg >= ag},
-                {"tipo": "X2", "label": f"{away} o Empate (X2)", "prob": prob_x2, "gano": ag >= hg},
-                {"tipo": "1", "label": f"{home} gana (1)", "prob": p1x2["local_1"], "gano": hg > ag},
-                {"tipo": "2", "label": f"{away} gana (2)", "prob": p1x2["visita_2"], "gano": ag > hg},
-                {"tipo": "O25", "label": "Over 2.5 Goles", "prob": pgol["over_2_5"], "gano": (hg + ag) > 2.5},
-                {"tipo": "U25", "label": "Under 2.5 Goles", "prob": pgol["under_2_5"], "gano": (hg + ag) < 2.5}
-            ]
-            opciones.sort(key=lambda x: x["prob"], reverse=True)
-            pick_elegido = opciones[0]
-
-            ml_fav_home = p1x2["local_1"] >= p1x2["visita_2"]
-            ml_acerto = (hg > ag) if ml_fav_home else (ag > hg)
-
-            if pick_elegido["gano"]:
-                aciertos_pick += 1
-            if ml_acerto:
-                aciertos_ml += 1
-
-            mercado_hist = analyze_market_only(
-                {"proveedor": "Pinnacle Cierre", "home_moneyline": row.get("PSH"), "draw_moneyline": row.get("PSD"), "away_moneyline": row.get("PSA")},
-                prior_df, home, away
-            )
-
-            audit_matches.append({
-                "fecha": row["DateParsed"].strftime("%Y-%m-%d"),
-                "local": home,
-                "visitante": away,
-                "marcador_real": f"{hg}–{ag}",
-                "pick_pre_juego": pick_elegido["label"],
-                "probabilidad_pick": pick_elegido["prob"],
-                "acerto": bool(pick_elegido["gano"]),
-                "bloque_1_mercado_cuotas": mercado_hist,
-                "bloque_2_deportivo_y_extracancha": dep
-            })
-
-        fecha_label = last_10["DateParsed"].max().strftime("%d %b").upper()
-        payload = {
-            "fecha_etiqueta": fecha_label,
-            "total": len(audit_matches),
+        return {
+            "modelo_iniciado": MODEL_START_DATE,
+            "total_registrados": len(lista),
+            "total_finalizados": len(finalizados),
             "aciertos_pick": aciertos_pick,
-            "aciertos_ml": aciertos_ml,
-            "partidos": audit_matches
+            "aciertos_ml": aciertos_1x2,
+            "partidos": lista
         }
-        set_cached("auditoria_full", payload)
-        return payload
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
