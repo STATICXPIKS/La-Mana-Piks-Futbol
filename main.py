@@ -7,7 +7,7 @@ import json
 import time
 import requests
 import xml.etree.ElementTree as ET
-from data_fetcher import load_historical_data, extract_team_windows, normalize_team
+from data_fetcher import load_historical_data, extract_team_windows, fetch_live_espn_slate, normalize_team
 from model_engine import analyze_market_only, analyze_sports_and_context
 from context_analyzer import (
     analyze_tactical_styles_and_neutralization,
@@ -16,7 +16,7 @@ from context_analyzer import (
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="2.4.0"
+    version="2.5.0"
 )
 
 app.add_middleware(
@@ -31,6 +31,10 @@ _CACHE: Dict[str, Any] = {}
 CACHE_TTL_SECONDS = 900
 AUDIT_LOG_FILE = "auditoria_real_picks.json"
 MODEL_START_DATE = "2026-11-25"
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json"
+}
 
 def get_cached(key: str):
     item = _CACHE.get(key)
@@ -65,7 +69,7 @@ def get_rss_feed_cached() -> List[Dict[str, Any]]:
     noticias = []
     for source_name, url in rss_urls:
         try:
-            r = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(url, timeout=6, headers=HTTP_HEADERS)
             if r.status_code != 200:
                 continue
             root = ET.fromstring(r.content)
@@ -86,7 +90,8 @@ def get_rss_feed_cached() -> List[Dict[str, Any]]:
         except Exception:
             continue
 
-    set_cached("rss_news", noticias)
+    if noticias:
+        set_cached("rss_news", noticias)
     return noticias
 
 def filter_team_news(all_news: List[Dict[str, Any]], home_espn: str, away_espn: str, home_short: str, away_short: str) -> Dict[str, Any]:
@@ -124,7 +129,7 @@ def get_standings_cached(known_teams: list) -> List[Dict[str, Any]]:
     standings_list = []
     try:
         url = "https://site.api.espn.com/apis/v2/sports/soccer/eng.1/standings"
-        resp = requests.get(url, timeout=8)
+        resp = requests.get(url, timeout=8, headers=HTTP_HEADERS)
         data = resp.json()
         entries = data["children"][0]["standings"]["entries"]
         for idx, entry in enumerate(entries, start=1):
@@ -173,7 +178,8 @@ def get_standings_cached(known_teams: list) -> List[Dict[str, Any]]:
     except Exception:
         pass
 
-    set_cached("standings_raw", standings_list)
+    if standings_list:
+        set_cached("standings_raw", standings_list)
     return standings_list
 
 def build_table_pressure_from_cached(table: List[Dict[str, Any]], home_team: str, away_team: str) -> Dict[str, Any]:
@@ -207,83 +213,94 @@ def build_table_pressure_from_cached(table: List[Dict[str, Any]], home_team: str
 
     return {"local": eval_t(home_team), "visitante": eval_t(away_team)}
 
-def fetch_day_by_day_espn_slate(known_teams: list) -> list:
+def parse_espn_events_to_slate(events: list, known_teams: list, seen_ids: set) -> list:
+    parsed = []
+    for ev in events:
+        ev_id = str(ev.get("id", ""))
+        if not ev_id or ev_id in seen_ids:
+            continue
+        comp = ev["competitions"][0]
+        if comp["status"]["type"]["state"] == "post":
+            continue
+        seen_ids.add(ev_id)
+
+        competitors = comp["competitors"]
+        home_c = next(c for c in competitors if c["homeAway"] == "home")
+        away_c = next(c for c in competitors if c["homeAway"] == "away")
+
+        home_espn = home_c["team"]["displayName"]
+        away_espn = away_c["team"]["displayName"]
+        home_norm = normalize_team(home_espn, known_teams)
+        away_norm = normalize_team(away_espn, known_teams)
+
+        odds_data = {}
+        if comp.get("odds"):
+            primary_odds = comp["odds"][0]
+            odds_data = {
+                "proveedor": primary_odds.get("provider", {}).get("name", "Mercado"),
+                "over_under_linea": primary_odds.get("overUnder"),
+                "home_moneyline": primary_odds.get("homeTeamOdds", {}).get("moneyLine"),
+                "away_moneyline": primary_odds.get("awayTeamOdds", {}).get("moneyLine"),
+                "draw_moneyline": primary_odds.get("drawOdds", {}).get("moneyLine"),
+            }
+
+        injuries_home, injuries_away = [], []
+        for inj_group in comp.get("injuries", []):
+            t_name = normalize_team(inj_group.get("team", {}).get("displayName", ""), known_teams)
+            for item in inj_group.get("injuries", []):
+                ath = item.get("athlete", {}).get("displayName", "")
+                st = item.get("status", "")
+                if ath:
+                    label = f"{ath} ({st})" if st else ath
+                    if t_name == home_norm:
+                        injuries_home.append(label)
+                    elif t_name == away_norm:
+                        injuries_away.append(label)
+
+        parsed.append({
+            "event_id": ev_id,
+            "fecha_utc": ev.get("date", datetime.now(timezone.utc).isoformat()),
+            "estado": comp["status"]["type"]["description"],
+            "local_espn": home_espn,
+            "visitante_espn": away_espn,
+            "local_modelo": home_norm,
+            "visitante_modelo": away_norm,
+            "record_local_temporada": home_c.get("records", [{}])[0].get("summary", ""),
+            "record_visita_temporada": away_c.get("records", [{}])[0].get("summary", ""),
+            "cuotas_mercado_raw": odds_data,
+            "bajas_reportadas": {"local": injuries_home, "visitante": injuries_away},
+            "jugadores_en_ambos_equipos": []
+        })
+    return parsed
+
+def fetch_full_round_espn_slate(known_teams: list) -> list:
     """
-    Consulta día por día en ESPN (de hoy hasta +7 días) para capturar
-    todos los partidos reales de cada jornada (Viernes, Sábado, Domingo, Lunes)
-    con su fecha y hora UTC exactas.
+    Obtiene toda la jornada completa (Viernes, Sábado, Domingo, Lunes)
+    consultando el rango de fechas con limit=100 y la cartelera general de ESPN.
     """
     now = datetime.now(timezone.utc)
+    start_str = now.strftime("%Y%m%d")
+    end_str = (now + timedelta(days=9)).strftime("%Y%m%d")
+
+    urls = [
+        f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={start_str}-{end_str}&limit=100",
+        "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?limit=100"
+    ]
+
     seen_ids = set()
     slate = []
 
-    for offset in range(0, 8):
-        target_day = now + timedelta(days=offset)
-        day_str = target_day.strftime("%Y%m%d")
-        url = f"https://site.api.espn.com/apis/v2/sports/soccer/eng.1/scoreboard?dates={day_str}"
+    for url in urls:
         try:
-            resp = requests.get(url, timeout=6)
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            for ev in data.get("events", []):
-                ev_id = str(ev.get("id", ""))
-                if not ev_id or ev_id in seen_ids:
-                    continue
-                comp = ev["competitions"][0]
-                if comp["status"]["type"]["state"] == "post":
-                    continue
-                seen_ids.add(ev_id)
-
-                competitors = comp["competitors"]
-                home_c = next(c for c in competitors if c["homeAway"] == "home")
-                away_c = next(c for c in competitors if c["homeAway"] == "away")
-
-                home_espn = home_c["team"]["displayName"]
-                away_espn = away_c["team"]["displayName"]
-                home_norm = normalize_team(home_espn, known_teams)
-                away_norm = normalize_team(away_espn, known_teams)
-
-                odds_data = {}
-                if comp.get("odds"):
-                    primary_odds = comp["odds"][0]
-                    odds_data = {
-                        "proveedor": primary_odds.get("provider", {}).get("name", "Mercado"),
-                        "over_under_linea": primary_odds.get("overUnder"),
-                        "home_moneyline": primary_odds.get("homeTeamOdds", {}).get("moneyLine"),
-                        "away_moneyline": primary_odds.get("awayTeamOdds", {}).get("moneyLine"),
-                        "draw_moneyline": primary_odds.get("drawOdds", {}).get("moneyLine"),
-                    }
-
-                injuries_home, injuries_away = [], []
-                for inj_group in comp.get("injuries", []):
-                    t_name = normalize_team(inj_group.get("team", {}).get("displayName", ""), known_teams)
-                    for item in inj_group.get("injuries", []):
-                        ath = item.get("athlete", {}).get("displayName", "")
-                        st = item.get("status", "")
-                        if ath:
-                            label = f"{ath} ({st})" if st else ath
-                            if t_name == home_norm:
-                                injuries_home.append(label)
-                            elif t_name == away_norm:
-                                injuries_away.append(label)
-
-                slate.append({
-                    "event_id": ev_id,
-                    "fecha_utc": ev.get("date", target_day.isoformat()),
-                    "estado": comp["status"]["type"]["description"],
-                    "local_espn": home_espn,
-                    "visitante_espn": away_espn,
-                    "local_modelo": home_norm,
-                    "visitante_modelo": away_norm,
-                    "record_local_temporada": home_c.get("records", [{}])[0].get("summary", ""),
-                    "record_visita_temporada": away_c.get("records", [{}])[0].get("summary", ""),
-                    "cuotas_mercado_raw": odds_data,
-                    "bajas_reportadas": {"local": injuries_home, "visitante": injuries_away},
-                    "jugadores_en_ambos_equipos": []
-                })
+            resp = requests.get(url, timeout=10, headers=HTTP_HEADERS)
+            if resp.status_code == 200:
+                events = resp.json().get("events", [])
+                slate.extend(parse_espn_events_to_slate(events, known_teams, seen_ids))
         except Exception:
             continue
+
+    if not slate:
+        slate = fetch_live_espn_slate(known_teams)
 
     slate.sort(key=lambda x: x["fecha_utc"])
     return slate
@@ -305,10 +322,6 @@ def save_audit_store(store: Dict[str, Any]):
         pass
 
 def registrar_pronosticos_prejuego(resultados: List[Dict[str, Any]]):
-    """
-    Congela los pronósticos emitidos antes de que inicie cada partido
-    para que la Auditoría sea 100% real desde hoy (25 Nov 2026) en adelante.
-    """
     store = load_audit_store()
     registros = store.setdefault("registros", {})
     changed = False
@@ -375,13 +388,13 @@ def health_check():
 @app.get("/api/premier/jornada")
 def get_premier_league_analysis() -> Dict[str, Any]:
     cached_resp = get_cached("jornada_full")
-    if cached_resp is not None:
+    if cached_resp is not None and len(cached_resp.get("partidos", [])) > 0:
         return cached_resp
 
     try:
         hist_df = get_historical_cached()
         known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
-        slate = fetch_day_by_day_espn_slate(known_teams)
+        slate = fetch_full_round_espn_slate(known_teams)
         standings_table = get_standings_cached(known_teams)
         all_rss = get_rss_feed_cached()
 
@@ -434,38 +447,34 @@ def get_premier_league_analysis() -> Dict[str, Any]:
                 "bloque_2_deportivo_y_extracancha": bloque_deportivo
             })
 
-        registrar_pronosticos_prejuego(resultados)
+        if resultados:
+            registrar_pronosticos_prejuego(resultados)
 
         payload = {
             "actualizado_utc": datetime.now(timezone.utc).isoformat(),
             "total_partidos_jornada": len(resultados),
             "partidos": resultados
         }
-        set_cached("jornada_full", payload)
+        if len(resultados) > 0:
+            set_cached("jornada_full", payload)
         return payload
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/premier/auditoria")
 def get_premier_real_audit() -> Dict[str, Any]:
-    """
-    Auditoría 100% real desde el nacimiento del modelo (25 Nov 2026).
-    Verifica en ESPN si los partidos ya concluyeron para calificarlos automáticamente
-    con ✓ o ✗, y muestra los pendientes listos para jugarse.
-    """
     try:
         store = load_audit_store()
         registros = store.get("registros", {})
         changed = False
 
-        # Verificar resultados reales en ESPN para los partidos registrados
         for ev_id, reg in registros.items():
             if reg.get("estado") == "FINALIZADO":
                 continue
             try:
                 day_str = reg["fecha_utc"][:10].replace("-", "")
-                url = f"https://site.api.espn.com/apis/v2/sports/soccer/eng.1/scoreboard?dates={day_str}"
-                r = requests.get(url, timeout=5)
+                url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates={day_str}&limit=50"
+                r = requests.get(url, timeout=5, headers=HTTP_HEADERS)
                 if r.status_code == 200:
                     for ev in r.json().get("events", []):
                         if str(ev.get("id")) == ev_id:
