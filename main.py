@@ -16,13 +16,12 @@ from context_analyzer import (
     analyze_tactical_styles_and_neutralization,
 )
 
-# Evitar que cualquier descarga CSV externa (urllib/pandas) cuelgue el servidor
 socket.setdefaulttimeout(8)
 
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="3.6.0"
+    version="3.7.0"
 )
 
 app.add_middleware(
@@ -34,6 +33,7 @@ app.add_middleware(
 )
 
 _CACHE: Dict[str, Any] = {}
+_TACTICAL_CACHE: Dict[str, Any] = {}
 _COMPUTE_LOCK = threading.Lock()
 _IS_COMPUTING = False
 _COMPUTE_STARTED_AT = 0.0
@@ -438,6 +438,12 @@ def registrar_pronosticos_prejuego(resultados: List[Dict[str, Any]]):
     if changed:
         save_audit_store(store)
 
+def _get_tactical_cached(hist_df, home: str, away: str) -> Dict[str, Any]:
+    key = f"{home}__{away}"
+    if key not in _TACTICAL_CACHE:
+        _TACTICAL_CACHE[key] = analyze_tactical_styles_and_neutralization(hist_df, home, away)
+    return _TACTICAL_CACHE[key]
+
 def _analyze_single_match(match: Dict[str, Any], hist_df, standings_table, all_rss) -> Dict[str, Any]:
     ref_date = datetime.fromisoformat(match["fecha_utc"].replace("Z", "+00:00"))
     home = match["local_modelo"]
@@ -460,9 +466,7 @@ def _analyze_single_match(match: Dict[str, Any], hist_df, standings_table, all_r
         former_players=match["jugadores_en_ambos_equipos"]
     )
 
-    bloque_deportivo["estilos_de_juego_y_neutralizacion"] = analyze_tactical_styles_and_neutralization(
-        hist_df, home, away
-    )
+    bloque_deportivo["estilos_de_juego_y_neutralizacion"] = _get_tactical_cached(hist_df, home, away)
     bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = build_table_pressure_from_cached(
         standings_table, home, away
     )
@@ -502,13 +506,16 @@ def _run_background_compute():
 
         _STEP_STATUS = f"4/4 Simulando {len(slate)} partidos"
         resultados = []
-        # Ejecución secuencial ligera (1 hilo) para no saturar los 512 MB de RAM de Render
-        for idx, m in enumerate(slate, start=1):
-            _STEP_STATUS = f"4/4 Simulando partido {idx}/{len(slate)}"
-            try:
-                resultados.append(_analyze_single_match(m, hist_df, standings_table, all_rss))
-            except Exception:
-                continue
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(_analyze_single_match, m, hist_df, standings_table, all_rss) for m in slate]
+            done_count = 0
+            for fut in as_completed(futures):
+                done_count += 1
+                _STEP_STATUS = f"4/4 Simulando partido {done_count}/{len(slate)}"
+                try:
+                    resultados.append(fut.result())
+                except Exception:
+                    continue
 
         resultados.sort(key=lambda x: x["partido_info"]["fecha_utc"])
 
@@ -535,8 +542,8 @@ def _run_background_compute():
 def trigger_async_compute():
     global _IS_COMPUTING, _COMPUTE_STARTED_AT
     with _COMPUTE_LOCK:
-        # Watchdog: si un cálculo anterior lleva > 50s atascado, permitir relanzarlo
-        if _IS_COMPUTING and (time.time() - _COMPUTE_STARTED_AT) < 50:
+        # Watchdog amplio de 180s para nunca interrumpir un cálculo en progreso
+        if _IS_COMPUTING and (time.time() - _COMPUTE_STARTED_AT) < 180:
             return
         _IS_COMPUTING = True
         _COMPUTE_STARTED_AT = time.time()
@@ -665,9 +672,7 @@ def simulate_custom_match(local: str, visitante: str) -> Dict[str, Any]:
             injuries={"local": [], "visitante": []},
             former_players=[]
         )
-        bloque_deportivo["estilos_de_juego_y_neutralizacion"] = analyze_tactical_styles_and_neutralization(
-            hist_df, home, away
-        )
+        bloque_deportivo["estilos_de_juego_y_neutralizacion"] = _get_tactical_cached(hist_df, home, away)
         bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = build_table_pressure_from_cached(
             standings_table, home, away
         )
