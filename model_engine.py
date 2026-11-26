@@ -96,8 +96,9 @@ def _compute_attack_defense_strengths(df: pd.DataFrame) -> Dict[str, Dict[str, f
         return {}
 
     df_sorted = df.sort_values("Date").copy()
-    max_date = df_sorted["Date"].max()
-    days_ago = (max_date - df_sorted["Date"]).dt.days.clip(lower=0)
+    dates_dt = pd.to_datetime(df_sorted["Date"], errors="coerce")
+    max_date = dates_dt.max()
+    days_ago = (max_date - dates_dt).dt.days.fillna(0).clip(lower=0)
     df_sorted["weight"] = np.exp(-days_ago / 145.0)
 
     w_sum = df_sorted["weight"].sum()
@@ -136,11 +137,7 @@ def _compute_attack_defense_strengths(df: pd.DataFrame) -> Dict[str, Dict[str, f
 
 
 def _get_cached_league_model(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Calcula parámetros de liga, Elo histórico y fuerzas de ataque/defensa
-    UNA SOLA VEZ por actualización del dataset en lugar de 20 veces.
-    """
-    sig = f"{len(df)}_{df['Date'].max() if not df.empty else 'empty'}"
+    sig = f"{len(df)}_{str(df['Date'].max()) if not df.empty else 'empty'}"
     if _MODEL_BASE_CACHE.get("sig") == sig:
         return _MODEL_BASE_CACHE["data"]
 
@@ -241,8 +238,10 @@ def analyze_market_only(
             c1 = float(r.get("PSH", 0) or r.get("B365H", 0) or 0)
             cx = float(r.get("PSD", 0) or r.get("B365D", 0) or 0)
             c2 = float(r.get("PSA", 0) or r.get("B365A", 0) or 0)
+            raw_d = r["Date"]
+            fecha_str = raw_d.strftime("%Y-%m-%d") if hasattr(raw_d, "strftime") else str(raw_d)[:10]
             h2h_closing.append({
-                "fecha": r["Date"].strftime("%Y-%m-%d"),
+                "fecha": fecha_str,
                 "local": r["HomeTeam"],
                 "visitante": r["AwayTeam"],
                 "cierre_pinnacle_1X2": f"{c1} / {cx} / {c2}" if c1 > 0 else "N/D",
