@@ -18,7 +18,7 @@ from context_analyzer import (
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="3.3.0"
+    version="3.4.0"
 )
 
 app.add_middleware(
@@ -31,7 +31,8 @@ app.add_middleware(
 
 _CACHE: Dict[str, Any] = {}
 _COMPUTE_LOCK = threading.Lock()
-CACHE_TTL_SECONDS = 900
+CACHE_TTL_SECONDS = 1800
+DISK_CACHE_FILE = "jornada_cache_v3.json"
 AUDIT_LOG_FILE = "auditoria_real_picks_v2.json"
 MODEL_START_DATE = "2026-11-25"
 HTTP_HEADERS = {
@@ -47,6 +48,25 @@ def get_cached(key: str):
 
 def set_cached(key: str, data: Any):
     _CACHE[key] = {"ts": time.time(), "data": data}
+
+def load_disk_jornada_cache():
+    if os.path.exists(DISK_CACHE_FILE):
+        try:
+            with open(DISK_CACHE_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if (time.time() - saved.get("ts", 0)) < CACHE_TTL_SECONDS and len(saved.get("data", {}).get("partidos", [])) > 0:
+                set_cached("jornada_full", saved["data"])
+                return saved["data"]
+        except Exception:
+            pass
+    return None
+
+def save_disk_jornada_cache(payload: Dict[str, Any]):
+    try:
+        with open(DISK_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "data": payload}, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 def get_historical_cached():
     df = get_cached("hist_df")
@@ -323,13 +343,6 @@ def fetch_full_round_espn_slate(known_teams: list) -> list:
     return slate
 
 def seleccionar_pick_inteligente(dep: Dict[str, Any], home: str, away: str) -> Dict[str, Any]:
-    """
-    Misma lógica multi-mercado que la interfaz web para garantizar
-    consistencia total entre PARTIDOS y AUDITORÍA:
-    1) ML directo si el favorito supera 49.5% con ventaja >= 12% sobre el rival.
-    2) Mercado de Goles (Over/Under 2.5) o Ambos Anotan (BTTS) si supera 53.5%.
-    3) Doble Oportunidad (1X / X2) en duelos cerrados sin dominio claro.
-    """
     p1x2 = dep["simulacion_monte_carlo"]["probabilidades_1X2_pct"]
     pgol = dep["simulacion_monte_carlo"]["mercados_goles_pct"]
 
@@ -416,11 +429,63 @@ def registrar_pronosticos_prejuego(resultados: List[Dict[str, Any]]):
     if changed:
         save_audit_store(store)
 
+def _analyze_single_match(match: Dict[str, Any], hist_df, standings_table, all_rss) -> Dict[str, Any]:
+    ref_date = datetime.fromisoformat(match["fecha_utc"].replace("Z", "+00:00"))
+    home = match["local_modelo"]
+    away = match["visitante_modelo"]
+
+    bloque_mercado = analyze_market_only(
+        odds_raw=match["cuotas_mercado_raw"],
+        historical_df=hist_df,
+        home_team=home,
+        away_team=away
+    )
+
+    windows = extract_team_windows(hist_df, home, away, ref_date)
+    bloque_deportivo = analyze_sports_and_context(
+        df=hist_df,
+        home_team=home,
+        away_team=away,
+        windows=windows,
+        injuries=match["bajas_reportadas"],
+        former_players=match["jugadores_en_ambos_equipos"]
+    )
+
+    bloque_deportivo["estilos_de_juego_y_neutralizacion"] = analyze_tactical_styles_and_neutralization(
+        hist_df, home, away
+    )
+    bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = build_table_pressure_from_cached(
+        standings_table, home, away
+    )
+    bloque_deportivo["factores_extra_cancha"]["prensa_lesiones_y_rumores_rss"] = filter_team_news(
+        all_rss, match["local_espn"], match["visitante_espn"], home, away
+    )
+
+    return {
+        "partido_info": {
+            "event_id": match["event_id"],
+            "fecha_utc": match["fecha_utc"],
+            "estado": match["estado"],
+            "local": match["local_espn"],
+            "visitante": match["visitante_espn"],
+            "local_modelo": home,
+            "visitante_modelo": away,
+            "record_local": match["record_local_temporada"],
+            "record_visita": match["record_visita_temporada"]
+        },
+        "bloque_1_mercado_cuotas": bloque_mercado,
+        "bloque_2_deportivo_y_extracancha": bloque_deportivo
+    }
+
 def compute_jornada_payload() -> Dict[str, Any]:
     with _COMPUTE_LOCK:
         cached_resp = get_cached("jornada_full")
         if cached_resp is not None and len(cached_resp.get("partidos", [])) > 0:
             return cached_resp
+
+        disk_resp = load_disk_jornada_cache()
+        if disk_resp is not None:
+            return disk_resp
 
         hist_df = get_historical_cached()
         known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
@@ -429,53 +494,16 @@ def compute_jornada_payload() -> Dict[str, Any]:
         all_rss = get_rss_feed_cached()
 
         resultados = []
-        for match in slate:
-            ref_date = datetime.fromisoformat(match["fecha_utc"].replace("Z", "+00:00"))
-            home = match["local_modelo"]
-            away = match["visitante_modelo"]
+        if slate:
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                futures = [pool.submit(_analyze_single_match, m, hist_df, standings_table, all_rss) for m in slate]
+                for fut in as_completed(futures):
+                    try:
+                        resultados.append(fut.result())
+                    except Exception:
+                        continue
 
-            bloque_mercado = analyze_market_only(
-                odds_raw=match["cuotas_mercado_raw"],
-                historical_df=hist_df,
-                home_team=home,
-                away_team=away
-            )
-
-            windows = extract_team_windows(hist_df, home, away, ref_date)
-            bloque_deportivo = analyze_sports_and_context(
-                df=hist_df,
-                home_team=home,
-                away_team=away,
-                windows=windows,
-                injuries=match["bajas_reportadas"],
-                former_players=match["jugadores_en_ambos_equipos"]
-            )
-
-            bloque_deportivo["estilos_de_juego_y_neutralizacion"] = analyze_tactical_styles_and_neutralization(
-                hist_df, home, away
-            )
-            bloque_deportivo["factores_extra_cancha"]["presion_tabla_y_clasificacion"] = build_table_pressure_from_cached(
-                standings_table, home, away
-            )
-            bloque_deportivo["factores_extra_cancha"]["prensa_lesiones_y_rumores_rss"] = filter_team_news(
-                all_rss, match["local_espn"], match["visitante_espn"], home, away
-            )
-
-            resultados.append({
-                "partido_info": {
-                    "event_id": match["event_id"],
-                    "fecha_utc": match["fecha_utc"],
-                    "estado": match["estado"],
-                    "local": match["local_espn"],
-                    "visitante": match["visitante_espn"],
-                    "local_modelo": home,
-                    "visitante_modelo": away,
-                    "record_local": match["record_local_temporada"],
-                    "record_visita": match["record_visita_temporada"]
-                },
-                "bloque_1_mercado_cuotas": bloque_mercado,
-                "bloque_2_deportivo_y_extracancha": bloque_deportivo
-            })
+        resultados.sort(key=lambda x: x["partido_info"]["fecha_utc"])
 
         if resultados:
             registrar_pronosticos_prejuego(resultados)
@@ -487,6 +515,7 @@ def compute_jornada_payload() -> Dict[str, Any]:
         }
         if len(resultados) > 0:
             set_cached("jornada_full", payload)
+            save_disk_jornada_cache(payload)
         return payload
 
 @app.on_event("startup")
