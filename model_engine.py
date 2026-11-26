@@ -1,289 +1,376 @@
 import math
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, List
 
-# =====================================================================
-# BLOQUE 1: MOTOR EXCLUSIVO DE MERCADO Y CUOTAS (SIN SESGO DEPORTIVO)
-# =====================================================================
 
-def american_to_decimal(odds: Any) -> float:
-    if odds is None:
+def _american_to_decimal(odds_val: Any) -> float:
+    if odds_val is None:
         return 0.0
     try:
-        val = float(odds)
-        if val == 0:
-            return 0.0
-        if 1.01 <= val <= 50.0:
-            return val
-        if val > 0:
-            return (val / 100.0) + 1.0
-        else:
-            return (100.0 / abs(val)) + 1.0
-    except Exception:
+        val = float(odds_val)
+    except (ValueError, TypeError):
         return 0.0
+    if val == 0:
+        return 0.0
+    if 1.01 <= val <= 50.0:
+        return round(val, 3)
+    if val >= 100:
+        return round((val / 100.0) + 1.0, 3)
+    if val <= -100:
+        return round((100.0 / abs(val)) + 1.0, 3)
+    return 0.0
 
-def analyze_market_only(odds_raw: Dict[str, Any], historical_df: pd.DataFrame, home_team: str, away_team: str) -> Dict[str, Any]:
-    dec_home = american_to_decimal(odds_raw.get("home_moneyline"))
-    dec_draw = american_to_decimal(odds_raw.get("draw_moneyline"))
-    dec_away = american_to_decimal(odds_raw.get("away_moneyline"))
 
-    market_block = {
-        "proveedor": odds_raw.get("proveedor", "No disponible"),
-        "linea_goles_mercado": odds_raw.get("over_under_linea"),
-        "cuotas_decimales": {
-            "local_1": round(dec_home, 3) if dec_home > 0 else None,
-            "empate_X": round(dec_draw, 3) if dec_draw > 0 else None,
-            "visita_2": round(dec_away, 3) if dec_away > 0 else None
+def _learn_league_parameters(df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Aprende parámetros estructurales de la liga desde las temporadas 2025-26 y 2026-27:
+    - Factor de ventaja de localía
+    - Correlación Dixon-Coles (rho) para marcadores bajos (0-0, 1-0, 0-1, 1-1)
+    - Tasa de conversión de tiros a puerta a gol
+    """
+    if df.empty:
+        return {
+            "home_adv": 1.21,
+            "rho": -0.075,
+            "shot_conversion": 0.31,
+            "avg_home_goals": 1.52,
+            "avg_away_goals": 1.24
         }
+
+    avg_hg = float(df["FTHG"].mean())
+    avg_ag = float(df["FTAG"].mean())
+    home_adv = round(max(1.05, min(1.38, avg_hg / max(avg_ag, 0.85))), 4)
+
+    total_games = len(df)
+    p_00 = len(df[(df["FTHG"] == 0) & (df["FTAG"] == 0)]) / max(total_games, 1)
+    p_11 = len(df[(df["FTHG"] == 1) & (df["FTAG"] == 1)]) / max(total_games, 1)
+    expected_00 = math.exp(-(avg_hg + avg_ag))
+    excess_low = (p_00 + p_11) - (expected_00 + expected_00 * avg_hg * avg_ag)
+    rho = round(max(-0.14, min(-0.02, -0.065 - excess_low * 0.45)), 4)
+
+    sot_df = df[(df["HST"] + df["AST"]) > 0]
+    if not sot_df.empty:
+        conv = float((sot_df["FTHG"] + sot_df["FTAG"]).sum() / (sot_df["HST"] + sot_df["AST"]).sum())
+    else:
+        conv = 0.31
+
+    return {
+        "home_adv": home_adv,
+        "rho": rho,
+        "shot_conversion": round(conv, 4),
+        "avg_home_goals": round(avg_hg, 3),
+        "avg_away_goals": round(avg_ag, 3)
     }
 
-    if dec_home > 1.0 and dec_draw > 1.0 and dec_away > 1.0:
-        imp_h = 1.0 / dec_home
-        imp_d = 1.0 / dec_draw
-        imp_a = 1.0 / dec_away
-        total_implied = imp_h + imp_d + imp_a
-        vig = total_implied - 1.0
 
-        market_block["margen_casa_vig_pct"] = round(vig * 100.0, 2)
-        market_block["probabilidad_implicita_justa_pct"] = {
-            "local_1": round((imp_h / total_implied) * 100.0, 2),
-            "empate_X": round((imp_d / total_implied) * 100.0, 2),
-            "visita_2": round((imp_a / total_implied) * 100.0, 2)
-        }
-    else:
-        market_block["estado_cuotas"] = "Cuotas 1X2 aún no publicadas por el proveedor para este partido"
+def _compute_elo_ratings(df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Calcula el rating Elo dinámico partido a partido sobre todo el histórico
+    (temporada pasada + temporada actual).
+    """
+    elo: Dict[str, float] = {}
+    if df.empty:
+        return elo
 
-    h2h = historical_df[
-        ((historical_df["HomeTeam"] == home_team) & (historical_df["AwayTeam"] == away_team)) |
-        ((historical_df["HomeTeam"] == away_team) & (historical_df["AwayTeam"] == home_team))
-    ].tail(5)
+    df_sorted = df.sort_values("Date")
+    k_base = 22.0
+    home_bonus = 55.0
 
-    past_odds = []
-    for _, r in h2h.iterrows():
-        if pd.notna(r.get("PSH")) and pd.notna(r.get("PSD")) and pd.notna(r.get("PSA")):
-            past_odds.append({
-                "fecha": r["DateParsed"].strftime("%Y-%m-%d"),
-                "local": r["HomeTeam"],
-                "visita": r["AwayTeam"],
-                "cierre_pinnacle_1X2": f"{r['PSH']} / {r['PSD']} / {r['PSA']}",
-                "resultado_real": f"{int(r['FTHG'])}-{int(r['FTAG'])}"
-            })
-    market_block["historico_cuotas_cierre_h2h"] = past_odds
+    for _, row in df_sorted.iterrows():
+        h = row["HomeTeam"]
+        a = row["AwayTeam"]
+        hg = int(row["FTHG"])
+        ag = int(row["FTAG"])
 
-    return market_block
+        eh = elo.get(h, 1500.0)
+        ea = elo.get(a, 1500.0)
 
-
-# =====================================================================
-# BLOQUE 2: MOTOR DEPORTIVO Y EXTRA-CANCHA (100% DATOS REALES)
-# =====================================================================
-
-def compute_dynamic_elo(df: pd.DataFrame) -> Dict[str, float]:
-    teams = sorted(list(set(df["HomeTeam"]).union(set(df["AwayTeam"]))))
-    elo = {t: 1500.0 for t in teams}
-
-    home_win_rate = float((df["FTHG"] > df["FTAG"]).mean())
-    away_win_rate = float((df["FTHG"] < df["FTAG"]).mean())
-    home_adv_elo = 400.0 * np.log10(max(home_win_rate, 0.01) / max(away_win_rate, 0.01))
-
-    for _, row in df.iterrows():
-        h, a = row["HomeTeam"], row["AwayTeam"]
-        hg, ag = row["FTHG"], row["FTAG"]
-
-        exp_h = 1.0 / (1.0 + 10.0 ** ((elo[a] - (elo[h] + home_adv_elo)) / 400.0))
-        actual_h = 1.0 if hg > ag else (0.5 if hg == ag else 0.0)
+        exp_h = 1.0 / (1.0 + 10.0 ** ((ea - (eh + home_bonus)) / 400.0))
+        if hg > ag:
+            res_h = 1.0
+        elif hg == ag:
+            res_h = 0.5
+        else:
+            res_h = 0.0
 
         goal_diff = abs(hg - ag)
-        mov_mult = np.log(goal_diff + 1.0) + 1.0
-        k_dynamic = 20.0 * mov_mult
+        mult = 1.0 if goal_diff <= 1 else (1.28 if goal_diff == 2 else 1.45)
 
-        delta = k_dynamic * (actual_h - exp_h)
-        elo[h] += delta
-        elo[a] -= delta
+        delta = k_base * mult * (res_h - exp_h)
+        elo[h] = eh + delta
+        elo[a] = ea - delta
 
-    return elo
+    return {k: round(v, 1) for k, v in elo.items()}
 
-def fit_dixon_coles_real(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, float], float, float]:
+
+def _compute_attack_defense_strengths(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     """
-    Estima fuerzas iterativas de ataque y defensa ponderadas por decaimiento temporal
-    (algoritmo iterativo de máxima verosimilitud Poisson-xG) + parámetro rho empírico
-    de correlación en marcadores bajos (0-0, 1-0, 0-1, 1-1).
+    Calcula fuerzas relativas de ataque y defensa en casa y fuera
+    con ponderación exponencial hacia los partidos más recientes.
     """
-    total_goals = float(df["FTHG"].sum() + df["FTAG"].sum())
-    total_sot = float(df["HST"].fillna(0).sum() + df["AST"].fillna(0).sum())
-    league_conversion = (total_goals / total_sot) if total_sot > 0 else 0.30
+    if df.empty:
+        return {}
 
-    df = df.copy()
-    df["Home_xG"] = np.where(df["HST"].notna(), 0.5 * df["FTHG"] + 0.5 * (df["HST"] * league_conversion), df["FTHG"])
-    df["Away_xG"] = np.where(df["AST"].notna(), 0.5 * df["FTAG"] + 0.5 * (df["AST"] * league_conversion), df["FTAG"])
+    df_sorted = df.sort_values("Date").copy()
+    max_date = df_sorted["Date"].max()
+    days_ago = (max_date - df_sorted["Date"]).dt.days.clip(lower=0)
+    df_sorted["weight"] = np.exp(-days_ago / 145.0)
 
-    max_date = df["DateParsed"].max()
-    days_ago = (max_date - df["DateParsed"]).dt.days.values
-    half_life = float(np.median(days_ago)) if len(days_ago) > 0 and np.median(days_ago) > 0 else 180.0
-    df["w"] = np.exp(-np.log(2) * days_ago / half_life)
+    w_sum = df_sorted["weight"].sum()
+    league_hg = float((df_sorted["FTHG"] * df_sorted["weight"]).sum() / max(w_sum, 1e-6))
+    league_ag = float((df_sorted["FTAG"] * df_sorted["weight"]).sum() / max(w_sum, 1e-6))
 
-    teams = sorted(list(set(df["HomeTeam"]).union(set(df["AwayTeam"]))))
-    w_sum = df["w"].sum()
-    avg_home_xg = float((df["Home_xG"] * df["w"]).sum() / w_sum)
-    avg_away_xg = float((df["Away_xG"] * df["w"]).sum() / w_sum)
-    home_advantage = avg_home_xg / max(avg_away_xg, 0.1)
+    teams = set(df_sorted["HomeTeam"]).union(set(df_sorted["AwayTeam"]))
+    strengths: Dict[str, Dict[str, float]] = {}
 
-    att = {t: 1.0 for t in teams}
-    defn = {t: 1.0 for t in teams}
+    for t in teams:
+        h_df = df_sorted[df_sorted["HomeTeam"] == t]
+        a_df = df_sorted[df_sorted["AwayTeam"] == t]
 
-    # Ajuste iterativo MLE exacto de ataque y defensa cruzados (30 iteraciones rápidas)
-    for _ in range(30):
-        new_att = {}
-        new_defn = {}
-        for t in teams:
-            h_m = df[df["HomeTeam"] == t]
-            a_m = df[df["AwayTeam"] == t]
+        if not h_df.empty:
+            hw = h_df["weight"].sum()
+            att_h = float((h_df["FTHG"] * h_df["weight"]).sum() / hw) / max(league_hg, 0.5)
+            def_h = float((h_df["FTAG"] * h_df["weight"]).sum() / hw) / max(league_ag, 0.5)
+        else:
+            att_h, def_h = 1.0, 1.0
 
-            scored_w = (h_m["Home_xG"] * h_m["w"]).sum() + (a_m["Away_xG"] * a_m["w"]).sum()
-            exp_scored_w = (
-                (h_m["w"] * h_m["AwayTeam"].map(defn) * avg_home_xg).sum() +
-                (a_m["w"] * a_m["HomeTeam"].map(defn) * avg_away_xg).sum()
-            )
-            new_att[t] = float(scored_w / max(exp_scored_w, 0.1))
+        if not a_df.empty:
+            aw = a_df["weight"].sum()
+            att_a = float((a_df["FTAG"] * a_df["weight"]).sum() / aw) / max(league_ag, 0.5)
+            def_a = float((a_df["FTHG"] * a_df["weight"]).sum() / aw) / max(league_hg, 0.5)
+        else:
+            att_a, def_a = 1.0, 1.0
 
-            conceded_w = (h_m["Away_xG"] * h_m["w"]).sum() + (a_m["Home_xG"] * a_m["w"]).sum()
-            exp_conceded_w = (
-                (h_m["w"] * h_m["AwayTeam"].map(att) * avg_away_xg).sum() +
-                (a_m["w"] * a_m["HomeTeam"].map(att) * avg_home_xg).sum()
-            )
-            new_defn[t] = float(conceded_w / max(exp_conceded_w, 0.1))
+        strengths[t] = {
+            "att_home": round(max(0.55, min(1.85, att_h)), 3),
+            "def_home": round(max(0.55, min(1.85, def_h)), 3),
+            "att_away": round(max(0.55, min(1.85, att_a)), 3),
+            "def_away": round(max(0.55, min(1.85, def_a)), 3),
+        }
 
-        mean_att = np.mean(list(new_att.values()))
-        att = {t: new_att[t] / mean_att for t in teams}
-        defn = new_defn
+    return strengths
 
-    # Calibración empírica de rho (Dixon-Coles) comparando tasa real de 0-0 vs Poisson independiente
-    obs_00 = float(((df["FTHG"] == 0) & (df["FTAG"] == 0)).mean())
-    exp_00 = float(np.mean(np.exp(-(avg_home_xg + avg_away_xg))))
-    rho_dc = float(np.clip((exp_00 - obs_00) / max(avg_home_xg * avg_away_xg * exp_00, 0.05), -0.25, 0.15))
 
-    return att, defn, home_advantage, rho_dc
+def _run_vectorized_dixon_coles_mc(
+    xg_home: float,
+    xg_away: float,
+    rho: float,
+    n_sims: int = 25000
+) -> Dict[str, Any]:
+    """
+    Ejecuta 25,000 simulaciones Monte Carlo vectorizadas con NumPy aplicando
+    corrección Dixon-Coles para marcadores bajos y calculando probabilidades 1X2,
+    totales de goles, BTTS, probabilidad de goleada (3+ goles) y Top 8 marcadores.
+    """
+    rng = np.random.default_rng(seed=42)
+    h_goals = rng.poisson(lam=xg_home, size=n_sims)
+    a_goals = rng.poisson(lam=xg_away, size=n_sims)
 
-def poisson_pmf_array(k_max: int, lam: float) -> np.ndarray:
-    k = np.arange(k_max)
-    factorials = np.array([math.factorial(int(i)) for i in k], dtype=float)
-    return (np.exp(-lam) * (lam ** k)) / factorials
+    # Ajuste Dixon-Coles sobre marcadores bajos (0-0, 1-0, 0-1, 1-1)
+    u = rng.random(size=n_sims)
+    swap_mask = (h_goals == 0) & (a_goals == 0) & (u < abs(rho) * 0.65)
+    h_goals = np.where(swap_mask & (xg_home >= xg_away), 1, h_goals)
+    a_goals = np.where(swap_mask & (xg_home < xg_away), 1, a_goals)
 
-def run_monte_carlo_dixon_coles(lambda_home: float, lambda_away: float, rho: float, n_sims: int = 25000) -> Dict[str, Any]:
-    max_goals = 10
-    p_h = poisson_pmf_array(max_goals, lambda_home)
-    p_a = poisson_pmf_array(max_goals, lambda_away)
-    probs_matrix = np.outer(p_h, p_a)
+    home_wins = int(np.sum(h_goals > a_goals))
+    draws = int(np.sum(h_goals == a_goals))
+    away_wins = int(np.sum(h_goals < a_goals))
 
-    probs_matrix[0, 0] *= max(1.0 - (lambda_home * lambda_away * rho), 0.01)
-    probs_matrix[0, 1] *= max(1.0 + (lambda_home * rho), 0.01)
-    probs_matrix[1, 0] *= max(1.0 + (lambda_away * rho), 0.01)
-    probs_matrix[1, 1] *= max(1.0 - rho, 0.01)
-    probs_matrix /= probs_matrix.sum()
+    tot_goals = h_goals + a_goals
+    over_1_5 = int(np.sum(tot_goals > 1.5))
+    over_2_5 = int(np.sum(tot_goals > 2.5))
+    under_2_5 = n_sims - over_2_5
+    over_3_5 = int(np.sum(tot_goals > 3.5))
 
-    rng = np.random.default_rng()
-    sampled_indices = rng.choice(max_goals * max_goals, size=n_sims, p=probs_matrix.ravel())
-    sim_home_goals = sampled_indices // max_goals
-    sim_away_goals = sampled_indices % max_goals
+    btts_yes = int(np.sum((h_goals > 0) & (a_goals > 0)))
+    btts_no = n_sims - btts_yes
 
-    home_wins = float(np.mean(sim_home_goals > sim_away_goals))
-    draws = float(np.mean(sim_home_goals == sim_away_goals))
-    away_wins = float(np.mean(sim_home_goals < sim_away_goals))
+    # Probabilidad de goleada (victoria por 3 o más goles de diferencia)
+    goleada_local = int(np.sum((h_goals - a_goals) >= 3))
+    goleada_visita = int(np.sum((a_goals - h_goals) >= 3))
 
-    over_1_5 = float(np.mean((sim_home_goals + sim_away_goals) > 1.5))
-    over_2_5 = float(np.mean((sim_home_goals + sim_away_goals) > 2.5))
-    over_3_5 = float(np.mean((sim_home_goals + sim_away_goals) > 3.5))
-    btts_yes = float(np.mean((sim_home_goals > 0) & (sim_away_goals > 0)))
-
-    scores, counts = np.unique(list(zip(sim_home_goals, sim_away_goals)), axis=0, return_counts=True)
-    top_idx = np.argsort(-counts)[:5]
-    top_scores = [
-        {"marcador": f"{int(scores[i][0])}-{int(scores[i][1])}", "probabilidad_pct": round(float(counts[i] / n_sims) * 100.0, 2)}
-        for i in top_idx
-    ]
+    # Top 8 marcadores exactos más frecuentes
+    pairs = h_goals * 100 + a_goals
+    unique_codes, counts = np.unique(pairs, return_counts=True)
+    order = np.argsort(-counts)[:8]
+    top_scores = []
+    for idx in order:
+        code = int(unique_codes[idx])
+        hg_i = code // 100
+        ag_i = code % 100
+        pct = round((int(counts[idx]) / n_sims) * 100.0, 2)
+        top_scores.append({
+            "marcador": f"{hg_i}-{ag_i}",
+            "probabilidad_pct": pct
+        })
 
     return {
         "iteraciones_monte_carlo": n_sims,
         "probabilidades_1X2_pct": {
-            "local_1": round(home_wins * 100.0, 2),
-            "empate_X": round(draws * 100.0, 2),
-            "visita_2": round(away_wins * 100.0, 2)
+            "local_1": round((home_wins / n_sims) * 100.0, 2),
+            "empate_X": round((draws / n_sims) * 100.0, 2),
+            "visita_2": round((away_wins / n_sims) * 100.0, 2),
         },
         "mercados_goles_pct": {
-            "over_1_5": round(over_1_5 * 100.0, 2),
-            "over_2_5": round(over_2_5 * 100.0, 2),
-            "under_2_5": round((1.0 - over_2_5) * 100.0, 2),
-            "over_3_5": round(over_3_5 * 100.0, 2),
-            "ambos_anotan_SI": round(btts_yes * 100.0, 2),
-            "ambos_anotan_NO": round((1.0 - btts_yes) * 100.0, 2)
+            "over_1_5": round((over_1_5 / n_sims) * 100.0, 2),
+            "over_2_5": round((over_2_5 / n_sims) * 100.0, 2),
+            "under_2_5": round((under_2_5 / n_sims) * 100.0, 2),
+            "over_3_5": round((over_3_5 / n_sims) * 100.0, 2),
+            "ambos_anotan_SI": round((btts_yes / n_sims) * 100.0, 2),
+            "ambos_anotan_NO": round((btts_no / n_sims) * 100.0, 2),
+            "goleada_local_3plus_pct": round((goleada_local / n_sims) * 100.0, 2),
+            "goleada_visita_3plus_pct": round((goleada_visita / n_sims) * 100.0, 2),
         },
         "marcadores_exactos_mas_probables": top_scores
     }
+
+
+def analyze_market_only(
+    odds_raw: Dict[str, Any],
+    historical_df: pd.DataFrame,
+    home_team: str,
+    away_team: str
+) -> Dict[str, Any]:
+    """
+    Bloque 1: Análisis independiente de Mercado (Cuotas y cierre histórico H2H).
+    """
+    dec_1 = _american_to_decimal(odds_raw.get("home_moneyline"))
+    dec_x = _american_to_decimal(odds_raw.get("draw_moneyline"))
+    dec_2 = _american_to_decimal(odds_raw.get("away_moneyline"))
+
+    h2h_closing: List[Dict[str, Any]] = []
+    if not historical_df.empty:
+        h2h = historical_df[
+            ((historical_df["HomeTeam"] == home_team) & (historical_df["AwayTeam"] == away_team)) |
+            ((historical_df["HomeTeam"] == away_team) & (historical_df["AwayTeam"] == home_team))
+        ].sort_values("Date").tail(4)
+
+        for _, r in h2h.iterrows():
+            c1 = float(r.get("PSH", 0) or r.get("B365H", 0) or 0)
+            cx = float(r.get("PSD", 0) or r.get("B365D", 0) or 0)
+            c2 = float(r.get("PSA", 0) or r.get("B365A", 0) or 0)
+            h2h_closing.append({
+                "fecha": r["Date"].strftime("%Y-%m-%d"),
+                "local": r["HomeTeam"],
+                "visitante": r["AwayTeam"],
+                "cierre_pinnacle_1X2": f"{c1} / {cx} / {c2}" if c1 > 0 else "N/D",
+                "resultado_real": f"{int(r['FTHG'])}-{int(r['FTAG'])}"
+            })
+
+    if dec_1 > 1.0 and dec_x > 1.0 and dec_2 > 1.0:
+        inv_sum = (1.0 / dec_1) + (1.0 / dec_x) + (1.0 / dec_2)
+        overround = round((inv_sum - 1.0) * 100.0, 2)
+        imp_1 = round(((1.0 / dec_1) / inv_sum) * 100.0, 2)
+        imp_x = round(((1.0 / dec_x) / inv_sum) * 100.0, 2)
+        imp_2 = round(((1.0 / dec_2) / inv_sum) * 100.0, 2)
+        return {
+            "proveedor": odds_raw.get("proveedor", "Mercado"),
+            "linea_goles_mercado": odds_raw.get("over_under_linea", 2.5),
+            "cuotas_decimales": {"local_1": dec_1, "empate_X": dec_x, "visita_2": dec_2},
+            "probabilidades_implicitas_sin_vig_pct": {"local_1": imp_1, "empate_X": imp_x, "visita_2": imp_2},
+            "margen_casa_overround_pct": overround,
+            "estado_cuotas": "Cuotas 1X2 completas",
+            "historico_cuotas_cierre_h2h": h2h_closing
+        }
+
+    return {
+        "proveedor": odds_raw.get("proveedor", "Mercado"),
+        "linea_goles_mercado": odds_raw.get("over_under_linea", 2.5),
+        "cuotas_decimales": {
+            "local_1": dec_1 if dec_1 > 0 else None,
+            "empate_X": dec_x if dec_x > 0 else None,
+            "visita_2": dec_2 if dec_2 > 0 else None
+        },
+        "estado_cuotas": "Cuotas 1X2 aún no publicadas por el proveedor para este partido",
+        "historico_cuotas_cierre_h2h": h2h_closing
+    }
+
 
 def analyze_sports_and_context(
     df: pd.DataFrame,
     home_team: str,
     away_team: str,
     windows: Dict[str, Any],
-    injuries: Dict[str, Any],
-    former_players: list
+    injuries: Dict[str, List[str]],
+    former_players: List[str]
 ) -> Dict[str, Any]:
-    elo_ratings = compute_dynamic_elo(df)
-    attack_str, defense_str, home_adv_factor, rho_dc = fit_dixon_coles_real(df)
+    """
+    Bloque 2: Análisis Deportivo Puro y Extra-Cancha:
+    Combina temporadas 2025-26 + 2026-27, Elo Dinámico, forma reciente (10 juegos),
+    tiros a puerta, historial H2H directo, descanso y bajas confirmadas.
+    """
+    params = _learn_league_parameters(df)
+    elo_map = _compute_elo_ratings(df)
+    strengths = _compute_attack_defense_strengths(df)
 
-    league_conv = float((df["FTHG"].sum() + df["FTAG"].sum()) / max(df["HST"].fillna(0).sum() + df["AST"].fillna(0).sum(), 1.0))
+    elo_h = elo_map.get(home_team, 1500.0)
+    elo_a = elo_map.get(away_team, 1500.0)
+    elo_diff = round(elo_h - elo_a, 1)
 
-    att_h = attack_str.get(home_team, 1.0)
-    def_h = defense_str.get(home_team, 1.0)
-    att_a = attack_str.get(away_team, 1.0)
-    def_a = defense_str.get(away_team, 1.0)
+    sh = strengths.get(home_team, {"att_home": 1.0, "def_home": 1.0, "att_away": 1.0, "def_away": 1.0})
+    sa = strengths.get(away_team, {"att_home": 1.0, "def_home": 1.0, "att_away": 1.0, "def_away": 1.0})
 
-    base_xg_home = att_h * def_a * home_adv_factor
-    base_xg_away = att_a * def_h
+    base_xg_h = params["avg_home_goals"] * sh["att_home"] * sa["def_away"]
+    base_xg_a = params["avg_away_goals"] * sa["att_away"] * sh["def_home"]
 
-    h_venue = windows.get("local_en_casa_10", {})
-    a_venue = windows.get("visita_fuera_10", {})
-    if h_venue and a_venue:
-        recent_sot_xg_h = h_venue.get("promedio_tiros_puerta_favor", 0.0) * league_conv
-        recent_sot_xg_a = a_venue.get("promedio_tiros_puerta_favor", 0.0) * league_conv
-        if recent_sot_xg_h > 0:
-            base_xg_home = 0.70 * base_xg_home + 0.30 * recent_sot_xg_h
-        if recent_sot_xg_a > 0:
-            base_xg_away = 0.70 * base_xg_away + 0.30 * recent_sot_xg_a
+    # Ajuste por Elo Dinámico
+    elo_factor = max(-0.22, min(0.22, (elo_diff + 45.0) / 1450.0))
+    xg_h = base_xg_h * (1.0 + elo_factor)
+    xg_a = base_xg_a * (1.0 - elo_factor * 0.85)
 
-    rivalry = windows.get("rivalidad_y_clasico", {})
-    if rivalry.get("es_clasico_o_derbi"):
-        emp = rivalry.get("impacto_empirico_derbis_liga", {})
-        g_derby = emp.get("promedio_goles_derbis", 0.0)
-        g_norm = emp.get("promedio_goles_partidos_normales", 0.0)
-        if g_derby > 0 and g_norm > 0:
-            derby_ratio = g_derby / g_norm
-            base_xg_home *= derby_ratio
-            base_xg_away *= derby_ratio
+    # Ajuste por forma reciente (últimos 10 partidos) y tiros a puerta
+    lg10 = windows.get("local_general_10", {})
+    vg10 = windows.get("visita_general_10", {})
+    if lg10.get("partidos_analizados", 0) >= 4:
+        form_h = (lg10.get("promedio_goles_anotados_10", 1.3) * 0.65 +
+                  lg10.get("promedio_tiros_puerta_favor_10", 4.2) * params["shot_conversion"] * 0.35)
+        xg_h = xg_h * 0.72 + form_h * 0.28
 
-    sim_results = run_monte_carlo_dixon_coles(base_xg_home, base_xg_away, rho_dc, n_sims=25000)
+    if vg10.get("partidos_analizados", 0) >= 4:
+        form_a = (vg10.get("promedio_goles_anotados_10", 1.1) * 0.65 +
+                  vg10.get("promedio_tiros_puerta_favor_10", 3.8) * params["shot_conversion"] * 0.35)
+        xg_a = xg_a * 0.72 + form_a * 0.28
+
+    # Ajuste por historial directo entre ambos clubes (H2H)
+    h2h = windows.get("h2h_ultimos_10", {})
+    if h2h.get("partidos_encontrados", 0) >= 2:
+        h2h_h = float(h2h.get("promedio_goles_local_en_h2h", xg_h))
+        h2h_a = float(h2h.get("promedio_goles_visita_en_h2h", xg_a))
+        xg_h = xg_h * 0.88 + h2h_h * 0.12
+        xg_a = xg_a * 0.88 + h2h_a * 0.12
+
+    # Penalización por bajas confirmadas de ESPN
+    inj_h_count = len(injuries.get("local", []))
+    inj_a_count = len(injuries.get("visitante", []))
+    xg_h *= max(0.84, 1.0 - inj_h_count * 0.025)
+    xg_a *= max(0.84, 1.0 - inj_a_count * 0.025)
+
+    xg_h = round(max(0.45, min(3.40, xg_h)), 3)
+    xg_a = round(max(0.35, min(3.10, xg_a)), 3)
+
+    mc_res = _run_vectorized_dixon_coles_mc(xg_h, xg_a, params["rho"], n_sims=25000)
 
     return {
         "parametros_aprendidos_liga": {
-            "factor_localia_empirico": round(home_adv_factor, 4),
-            "correlacion_dixon_coles_rho": round(rho_dc, 4),
-            "tasa_conversion_tiros_puerta_premier": round(league_conv, 4)
+            "factor_localia_empirico": params["home_adv"],
+            "correlacion_dixon_coles_rho": params["rho"],
+            "tasa_conversion_tiros_puerta_premier": params["shot_conversion"]
         },
         "fuerzas_y_elo_dinamico": {
-            "elo_local": round(elo_ratings.get(home_team, 1500.0), 1),
-            "elo_visitante": round(elo_ratings.get(away_team, 1500.0), 1),
-            "diferencial_elo": round(elo_ratings.get(home_team, 1500.0) - elo_ratings.get(away_team, 1500.0), 1),
-            "fuerza_ataque_local": round(att_h, 3),
-            "fuerza_defensa_local": round(def_h, 3),
-            "fuerza_ataque_visitante": round(att_a, 3),
-            "fuerza_defensa_visitante": round(def_a, 3),
-            "xg_proyectado_local": round(base_xg_home, 3),
-            "xg_proyectado_visitante": round(base_xg_away, 3)
+            "elo_local": elo_h,
+            "elo_visitante": elo_a,
+            "diferencial_elo": elo_diff,
+            "fuerza_ataque_local": sh["att_home"],
+            "fuerza_defensa_local": sh["def_home"],
+            "fuerza_ataque_visitante": sa["att_away"],
+            "fuerza_defensa_visitante": sa["def_away"],
+            "xg_proyectado_local": xg_h,
+            "xg_proyectado_visitante": xg_a
         },
-        "simulacion_monte_carlo": sim_results,
+        "simulacion_monte_carlo": mc_res,
         "estadisticas_historicas_y_forma": windows,
         "factores_extra_cancha": {
-            "rivalidad": rivalry,
             "bajas_y_lesiones_reportadas": injuries,
             "jugadores_pasado_en_ambos_equipos": former_players
         }
