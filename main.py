@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List
 import threading
+import traceback
 import socket
 import os
 import json
@@ -21,7 +22,7 @@ socket.setdefaulttimeout(8)
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="3.7.0"
+    version="3.8.0"
 )
 
 app.add_middleware(
@@ -506,34 +507,32 @@ def _run_background_compute():
 
         _STEP_STATUS = f"4/4 Simulando {len(slate)} partidos"
         resultados = []
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = [pool.submit(_analyze_single_match, m, hist_df, standings_table, all_rss) for m in slate]
-            done_count = 0
-            for fut in as_completed(futures):
-                done_count += 1
-                _STEP_STATUS = f"4/4 Simulando partido {done_count}/{len(slate)}"
-                try:
-                    resultados.append(fut.result())
-                except Exception:
-                    continue
+        for idx, m in enumerate(slate, start=1):
+            _STEP_STATUS = f"4/4 Simulando partido {idx}/{len(slate)}"
+            try:
+                res_item = _analyze_single_match(m, hist_df, standings_table, all_rss)
+                resultados.append(res_item)
+            except Exception as match_err:
+                _LAST_ERROR = f"{m.get('local_modelo')} vs {m.get('visitante_modelo')}: {match_err}"
+                continue
 
         resultados.sort(key=lambda x: x["partido_info"]["fecha_utc"])
 
         if resultados:
             registrar_pronosticos_prejuego(resultados)
-
-        payload = {
-            "cargando": False,
-            "actualizado_utc": datetime.now(timezone.utc).isoformat(),
-            "total_partidos_jornada": len(resultados),
-            "partidos": resultados
-        }
-        if len(resultados) > 0:
+            payload = {
+                "cargando": False,
+                "actualizado_utc": datetime.now(timezone.utc).isoformat(),
+                "total_partidos_jornada": len(resultados),
+                "partidos": resultados
+            }
             set_cached("jornada_full", payload)
             save_disk_jornada_cache(payload)
             _STEP_STATUS = "Listo"
+        else:
+            _STEP_STATUS = f"Sin resultados ({_LAST_ERROR})"
     except Exception as e:
-        _LAST_ERROR = str(e)
+        _LAST_ERROR = f"{e} | {traceback.format_exc()[-250:]}"
         _STEP_STATUS = f"Error: {e}"
     finally:
         _IS_COMPUTING = False
@@ -542,7 +541,6 @@ def _run_background_compute():
 def trigger_async_compute():
     global _IS_COMPUTING, _COMPUTE_STARTED_AT
     with _COMPUTE_LOCK:
-        # Watchdog amplio de 180s para nunca interrumpir un cálculo en progreso
         if _IS_COMPUTING and (time.time() - _COMPUTE_STARTED_AT) < 180:
             return
         _IS_COMPUTING = True
