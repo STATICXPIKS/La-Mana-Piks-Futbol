@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Any, List
 
+_MODEL_BASE_CACHE: Dict[str, Any] = {}
+
 
 def _american_to_decimal(odds_val: Any) -> float:
     if odds_val is None:
@@ -23,12 +25,6 @@ def _american_to_decimal(odds_val: Any) -> float:
 
 
 def _learn_league_parameters(df: pd.DataFrame) -> Dict[str, float]:
-    """
-    Aprende parámetros estructurales de la liga desde las temporadas 2025-26 y 2026-27:
-    - Factor de ventaja de localía
-    - Correlación Dixon-Coles (rho) para marcadores bajos (0-0, 1-0, 0-1, 1-1)
-    - Tasa de conversión de tiros a puerta a gol
-    """
     if df.empty:
         return {
             "home_adv": 1.21,
@@ -65,10 +61,6 @@ def _learn_league_parameters(df: pd.DataFrame) -> Dict[str, float]:
 
 
 def _compute_elo_ratings(df: pd.DataFrame) -> Dict[str, float]:
-    """
-    Calcula el rating Elo dinámico partido a partido sobre todo el histórico
-    (temporada pasada + temporada actual).
-    """
     elo: Dict[str, float] = {}
     if df.empty:
         return elo
@@ -77,22 +69,17 @@ def _compute_elo_ratings(df: pd.DataFrame) -> Dict[str, float]:
     k_base = 22.0
     home_bonus = 55.0
 
-    for _, row in df_sorted.iterrows():
-        h = row["HomeTeam"]
-        a = row["AwayTeam"]
-        hg = int(row["FTHG"])
-        ag = int(row["FTAG"])
-
+    for h, a, hg, ag in zip(
+        df_sorted["HomeTeam"].tolist(),
+        df_sorted["AwayTeam"].tolist(),
+        df_sorted["FTHG"].astype(int).tolist(),
+        df_sorted["FTAG"].astype(int).tolist()
+    ):
         eh = elo.get(h, 1500.0)
         ea = elo.get(a, 1500.0)
 
         exp_h = 1.0 / (1.0 + 10.0 ** ((ea - (eh + home_bonus)) / 400.0))
-        if hg > ag:
-            res_h = 1.0
-        elif hg == ag:
-            res_h = 0.5
-        else:
-            res_h = 0.0
+        res_h = 1.0 if hg > ag else (0.5 if hg == ag else 0.0)
 
         goal_diff = abs(hg - ag)
         mult = 1.0 if goal_diff <= 1 else (1.28 if goal_diff == 2 else 1.45)
@@ -105,10 +92,6 @@ def _compute_elo_ratings(df: pd.DataFrame) -> Dict[str, float]:
 
 
 def _compute_attack_defense_strengths(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    """
-    Calcula fuerzas relativas de ataque y defensa en casa y fuera
-    con ponderación exponencial hacia los partidos más recientes.
-    """
     if df.empty:
         return {}
 
@@ -152,22 +135,35 @@ def _compute_attack_defense_strengths(df: pd.DataFrame) -> Dict[str, Dict[str, f
     return strengths
 
 
+def _get_cached_league_model(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Calcula parámetros de liga, Elo histórico y fuerzas de ataque/defensa
+    UNA SOLA VEZ por actualización del dataset en lugar de 20 veces.
+    """
+    sig = f"{len(df)}_{df['Date'].max() if not df.empty else 'empty'}"
+    if _MODEL_BASE_CACHE.get("sig") == sig:
+        return _MODEL_BASE_CACHE["data"]
+
+    data = {
+        "params": _learn_league_parameters(df),
+        "elo_map": _compute_elo_ratings(df),
+        "strengths": _compute_attack_defense_strengths(df),
+    }
+    _MODEL_BASE_CACHE["sig"] = sig
+    _MODEL_BASE_CACHE["data"] = data
+    return data
+
+
 def _run_vectorized_dixon_coles_mc(
     xg_home: float,
     xg_away: float,
     rho: float,
     n_sims: int = 25000
 ) -> Dict[str, Any]:
-    """
-    Ejecuta 25,000 simulaciones Monte Carlo vectorizadas con NumPy aplicando
-    corrección Dixon-Coles para marcadores bajos y calculando probabilidades 1X2,
-    totales de goles, BTTS, probabilidad de goleada (3+ goles) y Top 8 marcadores.
-    """
     rng = np.random.default_rng(seed=42)
     h_goals = rng.poisson(lam=xg_home, size=n_sims)
     a_goals = rng.poisson(lam=xg_away, size=n_sims)
 
-    # Ajuste Dixon-Coles sobre marcadores bajos (0-0, 1-0, 0-1, 1-1)
     u = rng.random(size=n_sims)
     swap_mask = (h_goals == 0) & (a_goals == 0) & (u < abs(rho) * 0.65)
     h_goals = np.where(swap_mask & (xg_home >= xg_away), 1, h_goals)
@@ -186,11 +182,9 @@ def _run_vectorized_dixon_coles_mc(
     btts_yes = int(np.sum((h_goals > 0) & (a_goals > 0)))
     btts_no = n_sims - btts_yes
 
-    # Probabilidad de goleada (victoria por 3 o más goles de diferencia)
     goleada_local = int(np.sum((h_goals - a_goals) >= 3))
     goleada_visita = int(np.sum((a_goals - h_goals) >= 3))
 
-    # Top 8 marcadores exactos más frecuentes
     pairs = h_goals * 100 + a_goals
     unique_codes, counts = np.unique(pairs, return_counts=True)
     order = np.argsort(-counts)[:8]
@@ -232,9 +226,6 @@ def analyze_market_only(
     home_team: str,
     away_team: str
 ) -> Dict[str, Any]:
-    """
-    Bloque 1: Análisis independiente de Mercado (Cuotas y cierre histórico H2H).
-    """
     dec_1 = _american_to_decimal(odds_raw.get("home_moneyline"))
     dec_x = _american_to_decimal(odds_raw.get("draw_moneyline"))
     dec_2 = _american_to_decimal(odds_raw.get("away_moneyline"))
@@ -295,14 +286,10 @@ def analyze_sports_and_context(
     injuries: Dict[str, List[str]],
     former_players: List[str]
 ) -> Dict[str, Any]:
-    """
-    Bloque 2: Análisis Deportivo Puro y Extra-Cancha:
-    Combina temporadas 2025-26 + 2026-27, Elo Dinámico, forma reciente (10 juegos),
-    tiros a puerta, historial H2H directo, descanso y bajas confirmadas.
-    """
-    params = _learn_league_parameters(df)
-    elo_map = _compute_elo_ratings(df)
-    strengths = _compute_attack_defense_strengths(df)
+    base = _get_cached_league_model(df)
+    params = base["params"]
+    elo_map = base["elo_map"]
+    strengths = base["strengths"]
 
     elo_h = elo_map.get(home_team, 1500.0)
     elo_a = elo_map.get(away_team, 1500.0)
@@ -314,12 +301,10 @@ def analyze_sports_and_context(
     base_xg_h = params["avg_home_goals"] * sh["att_home"] * sa["def_away"]
     base_xg_a = params["avg_away_goals"] * sa["att_away"] * sh["def_home"]
 
-    # Ajuste por Elo Dinámico
     elo_factor = max(-0.22, min(0.22, (elo_diff + 45.0) / 1450.0))
     xg_h = base_xg_h * (1.0 + elo_factor)
     xg_a = base_xg_a * (1.0 - elo_factor * 0.85)
 
-    # Ajuste por forma reciente (últimos 10 partidos) y tiros a puerta
     lg10 = windows.get("local_general_10", {})
     vg10 = windows.get("visita_general_10", {})
     if lg10.get("partidos_analizados", 0) >= 4:
@@ -332,7 +317,6 @@ def analyze_sports_and_context(
                   vg10.get("promedio_tiros_puerta_favor_10", 3.8) * params["shot_conversion"] * 0.35)
         xg_a = xg_a * 0.72 + form_a * 0.28
 
-    # Ajuste por historial directo entre ambos clubes (H2H)
     h2h = windows.get("h2h_ultimos_10", {})
     if h2h.get("partidos_encontrados", 0) >= 2:
         h2h_h = float(h2h.get("promedio_goles_local_en_h2h", xg_h))
@@ -340,7 +324,6 @@ def analyze_sports_and_context(
         xg_h = xg_h * 0.88 + h2h_h * 0.12
         xg_a = xg_a * 0.88 + h2h_a * 0.12
 
-    # Penalización por bajas confirmadas de ESPN
     inj_h_count = len(injuries.get("local", []))
     inj_a_count = len(injuries.get("visitante", []))
     xg_h *= max(0.84, 1.0 - inj_h_count * 0.025)
