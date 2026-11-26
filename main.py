@@ -22,7 +22,7 @@ socket.setdefaulttimeout(8)
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="3.8.0"
+    version="3.9.0"
 )
 
 app.add_middleware(
@@ -35,6 +35,7 @@ app.add_middleware(
 
 _CACHE: Dict[str, Any] = {}
 _TACTICAL_CACHE: Dict[str, Any] = {}
+_TRANSLATION_CACHE: Dict[str, str] = {}
 _COMPUTE_LOCK = threading.Lock()
 _IS_COMPUTING = False
 _COMPUTE_STARTED_AT = 0.0
@@ -57,6 +58,28 @@ def get_cached(key: str):
 
 def set_cached(key: str, data: Any):
     _CACHE[key] = {"ts": time.time(), "data": data}
+
+def _translate_to_spanish(text: str) -> str:
+    if not text:
+        return ""
+    if text in _TRANSLATION_CACHE:
+        return _TRANSLATION_CACHE[text]
+    try:
+        resp = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "en", "tl": "es", "dt": "t", "q": text},
+            timeout=3,
+            headers=HTTP_HEADERS
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            translated = "".join(part[0] for part in data[0] if part and part[0])
+            if translated:
+                _TRANSLATION_CACHE[text] = translated
+                return translated
+    except Exception:
+        pass
+    return text
 
 def load_disk_jornada_cache():
     if os.path.exists(DISK_CACHE_FILE):
@@ -86,36 +109,48 @@ def get_historical_cached():
     return df
 
 def get_rss_feed_cached() -> List[Dict[str, Any]]:
-    cached = get_cached("rss_news")
+    cached = get_cached("rss_news_es")
     if cached is not None:
         return cached
 
-    rss_urls = [
-        ("BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml"),
-        ("Sky Sports", "https://www.skysports.com/rss/11095")
+    rss_sources = [
+        ("ESPN Deportes", "https://www.espn.com.mx/espn/rss/futbol/liga-premier-inglaterra/news", False),
+        ("AS Premier", "https://feeds.as.com/mrss-s/pages/as/site/as.com/section/futbol/subsection/internacional/inglaterra/", False),
+        ("BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml", True),
+        ("Sky Sports", "https://www.skysports.com/rss/11095", True)
     ]
     alert_terms = [
         "injury", "injured", "fitness", "doubt", "ruled out", "hamstring", "illness",
         "sacked", "manager", "boss", "pressure", "return", "training", "ban", "suspended",
-        "blow", "boost", "contract", "dispute", "rumour", "weather", "postponed"
+        "blow", "boost", "contract", "dispute", "rumour", "weather", "postponed",
+        "lesión", "lesionado", "baja", "duda", "descartado", "sanción", "suspendido",
+        "técnico", "entrenador", "despedido", "contrato", "regresa", "alarma", "alerta"
     ]
     noticias = []
-    for source_name, url in rss_urls:
+    for source_name, url, needs_translation in rss_sources:
         try:
             r = requests.get(url, timeout=4, headers=HTTP_HEADERS)
             if r.status_code != 200:
                 continue
             root = ET.fromstring(r.content)
-            for item in root.findall(".//item")[:20]:
-                title = (item.findtext("title") or "").strip()
-                desc = (item.findtext("description") or "").strip()
+            limit_items = 12 if needs_translation else 15
+            for item in root.findall(".//item")[:limit_items]:
+                title_raw = (item.findtext("title") or "").strip()
+                desc_raw = (item.findtext("description") or "").strip()
                 pub = (item.findtext("pubDate") or "").strip()
-                txt = f"{title} {desc}".lower()
+                if not title_raw:
+                    continue
+                txt = f"{title_raw} {desc_raw}".lower()
                 is_alert = any(t in txt for t in alert_terms)
+
+                title_es = _translate_to_spanish(title_raw) if needs_translation else title_raw
+                desc_es = _translate_to_spanish(desc_raw[:160]) if (needs_translation and desc_raw) else desc_raw[:180]
+
                 noticias.append({
                     "fuente": source_name,
-                    "titular": title,
-                    "resumen": desc[:180] + ("..." if len(desc) > 180 else ""),
+                    "titular": title_es,
+                    "titular_en": title_raw,
+                    "resumen": desc_es + ("..." if len(desc_raw) > 180 else ""),
                     "fecha": pub,
                     "tipo": "ALERTA / BAJA / DT" if is_alert else "NOTICIA LIGA",
                     "critica": is_alert
@@ -124,7 +159,7 @@ def get_rss_feed_cached() -> List[Dict[str, Any]]:
             continue
 
     if noticias:
-        set_cached("rss_news", noticias)
+        set_cached("rss_news_es", noticias)
     return noticias
 
 def filter_team_news(all_news: List[Dict[str, Any]], home_espn: str, away_espn: str, home_short: str, away_short: str) -> Dict[str, Any]:
@@ -141,7 +176,7 @@ def filter_team_news(all_news: List[Dict[str, Any]], home_espn: str, away_espn: 
 
     nh, na = [], []
     for n in all_news:
-        txt = f"{n['titular']} {n['resumen']}".lower()
+        txt = f"{n['titular']} {n.get('titular_en', '')} {n['resumen']}".lower()
         entry = {
             "fuente": n["fuente"],
             "titular": n["titular"],
