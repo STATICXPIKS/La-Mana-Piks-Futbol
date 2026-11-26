@@ -18,7 +18,7 @@ from context_analyzer import (
 app = FastAPI(
     title="La Maña Picks - Motor Cuantitativo Fútbol",
     description="Análisis independiente de Mercado (Cuotas) y Rendimiento Deportivo/Extra-Cancha basado 100% en datos reales.",
-    version="3.4.0"
+    version="3.5.0"
 )
 
 app.add_middleware(
@@ -31,6 +31,8 @@ app.add_middleware(
 
 _CACHE: Dict[str, Any] = {}
 _COMPUTE_LOCK = threading.Lock()
+_IS_COMPUTING = False
+_LAST_ERROR = ""
 CACHE_TTL_SECONDS = 1800
 DISK_CACHE_FILE = "jornada_cache_v3.json"
 AUDIT_LOG_FILE = "auditoria_real_picks_v2.json"
@@ -477,76 +479,88 @@ def _analyze_single_match(match: Dict[str, Any], hist_df, standings_table, all_r
         "bloque_2_deportivo_y_extracancha": bloque_deportivo
     }
 
-def compute_jornada_payload() -> Dict[str, Any]:
+def _run_background_compute():
+    global _IS_COMPUTING, _LAST_ERROR
     with _COMPUTE_LOCK:
-        cached_resp = get_cached("jornada_full")
-        if cached_resp is not None and len(cached_resp.get("partidos", [])) > 0:
-            return cached_resp
+        if get_cached("jornada_full") is not None:
+            _IS_COMPUTING = False
+            return
+        _IS_COMPUTING = True
+        _LAST_ERROR = ""
+        try:
+            hist_df = get_historical_cached()
+            known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
+            slate = fetch_full_round_espn_slate(known_teams)
+            standings_table = get_standings_cached(known_teams)
+            all_rss = get_rss_feed_cached()
 
-        disk_resp = load_disk_jornada_cache()
-        if disk_resp is not None:
-            return disk_resp
+            resultados = []
+            if slate:
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    futures = [pool.submit(_analyze_single_match, m, hist_df, standings_table, all_rss) for m in slate]
+                    for fut in as_completed(futures):
+                        try:
+                            resultados.append(fut.result())
+                        except Exception:
+                            continue
 
-        hist_df = get_historical_cached()
-        known_teams = sorted(list(set(hist_df["HomeTeam"]).union(set(hist_df["AwayTeam"]))))
-        slate = fetch_full_round_espn_slate(known_teams)
-        standings_table = get_standings_cached(known_teams)
-        all_rss = get_rss_feed_cached()
+            resultados.sort(key=lambda x: x["partido_info"]["fecha_utc"])
 
-        resultados = []
-        if slate:
-            with ThreadPoolExecutor(max_workers=6) as pool:
-                futures = [pool.submit(_analyze_single_match, m, hist_df, standings_table, all_rss) for m in slate]
-                for fut in as_completed(futures):
-                    try:
-                        resultados.append(fut.result())
-                    except Exception:
-                        continue
+            if resultados:
+                registrar_pronosticos_prejuego(resultados)
 
-        resultados.sort(key=lambda x: x["partido_info"]["fecha_utc"])
+            payload = {
+                "cargando": False,
+                "actualizado_utc": datetime.now(timezone.utc).isoformat(),
+                "total_partidos_jornada": len(resultados),
+                "partidos": resultados
+            }
+            if len(resultados) > 0:
+                set_cached("jornada_full", payload)
+                save_disk_jornada_cache(payload)
+        except Exception as e:
+            _LAST_ERROR = str(e)
+        finally:
+            _IS_COMPUTING = False
 
-        if resultados:
-            registrar_pronosticos_prejuego(resultados)
-
-        payload = {
-            "actualizado_utc": datetime.now(timezone.utc).isoformat(),
-            "total_partidos_jornada": len(resultados),
-            "partidos": resultados
-        }
-        if len(resultados) > 0:
-            set_cached("jornada_full", payload)
-            save_disk_jornada_cache(payload)
-        return payload
+def trigger_async_compute():
+    global _IS_COMPUTING
+    if not _IS_COMPUTING:
+        _IS_COMPUTING = True
+        threading.Thread(target=_run_background_compute, daemon=True).start()
 
 @app.on_event("startup")
 def warmup_cache_on_boot():
-    def _bg():
-        try:
-            compute_jornada_payload()
-        except Exception:
-            pass
-    threading.Thread(target=_bg, daemon=True).start()
+    if load_disk_jornada_cache() is None:
+        trigger_async_compute()
 
 @app.get("/")
 def health_check():
+    cached = get_cached("jornada_full") or load_disk_jornada_cache()
     return {
         "status": "online",
         "proyecto": "La-Mana-Piks-Futbol",
         "liga": "Premier League (2026-2027)",
         "modelo_iniciado": MODEL_START_DATE,
-        "jornada_en_cache": len((get_cached("jornada_full") or {}).get("partidos", []))
+        "calculando": _IS_COMPUTING,
+        "jornada_en_cache": len((cached or {}).get("partidos", [])),
+        "ultimo_error": _LAST_ERROR
     }
 
 @app.get("/api/premier/jornada")
 def get_premier_league_analysis() -> Dict[str, Any]:
-    cached_resp = get_cached("jornada_full")
+    cached_resp = get_cached("jornada_full") or load_disk_jornada_cache()
     if cached_resp is not None and len(cached_resp.get("partidos", [])) > 0:
         return cached_resp
 
-    try:
-        return compute_jornada_payload()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Nunca bloquear la conexión HTTP: dispara cálculo en segundo plano y responde al instante
+    trigger_async_compute()
+    return {
+        "cargando": True,
+        "mensaje": "Calculando simulaciones Monte Carlo en segundo plano...",
+        "total_partidos_jornada": 0,
+        "partidos": []
+    }
 
 @app.get("/api/premier/auditoria")
 def get_premier_real_audit() -> Dict[str, Any]:
